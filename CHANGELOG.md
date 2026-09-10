@@ -15,3 +15,9 @@ here into the GitHub release body. See `docs/releasing.md`.
 ## Unreleased
 
 Nothing yet.
+
+## 0.1.0 — 2026-09-10
+
+### Other
+
+- initial commit
