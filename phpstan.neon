@@ -1,0 +1,8 @@
+parameters:
+    level: 8
+    paths:
+        - src
+
+    # Level 9 would mean threading types through the config arrays, which are
+    # arbitrary JSON out of composer.json and honestly mixed. Proving otherwise
+    # would take casts and asserts that assert nothing.

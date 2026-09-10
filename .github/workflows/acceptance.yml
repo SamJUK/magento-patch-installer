@@ -1,0 +1,83 @@
+name: Acceptance
+
+on:
+  # Docker per Magento version is the expensive thing here, so it does not run
+  # for a commit that only touched prose — including the changelog commit a
+  # release makes.
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'docs/**']
+  # Every pull request, not only labelled ones. The full matrix is still gated
+  # on the label below, but an unlabelled pull request used to get no
+  # acceptance signal at all and the suite ran on master after the merge —
+  # which finds breakage in the wrong place, and depends on remembering to
+  # apply a label.
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Per commit on master, per branch on a pull request. Grouping master by ref
+  # made consecutive pushes queue behind each other rather than cancel, which
+  # reads as "CI has not finished" for as long as the queue is deep.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # One image on every pull request. A fifth of the cost of the matrix, and it
+  # catches the breakage that matters most: the plugin not loading, a command
+  # not registering, patching not happening at all. 2.4.8-p5 because it is a
+  # current supported release, so it exercises the OK banner rather than the
+  # end-of-life WARN one.
+  smoke:
+    name: Smoke (2.4.8-p5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run acceptance suite against one image
+        run: tests/acceptance.sh 2.4.8-p5-php8.4
+
+  generate-matrix:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-tests'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate test matrix
+        id: set-matrix
+        run: |
+          MATRIX=$(jq -c '[
+            to_entries[] |
+            .value as $versions |
+            .key as $package |
+            $versions | to_entries[] |
+            {
+              package: $package,
+              magento_version: .key,
+              php_version: .value
+            }
+          ]' tests/matrix.json)
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  acceptance:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    name: ${{ matrix.magento_version }} (${{ matrix.php_version }})
+    steps:
+      - name: Checkout the plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Fixtures are generated from the installed Magento inside the container,
+      # so the suite depends on nothing outside this repository.
+      - name: Run acceptance suite
+        run: tests/acceptance.sh ${{ matrix.magento_version }}-${{ matrix.php_version }}

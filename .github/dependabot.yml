@@ -1,0 +1,10 @@
+# Pinned action SHAs only stay current if something bumps them, and a stale pin
+# is worse than a floating tag: it looks deliberate. Only github-actions —
+# there are two dev dependencies and no runtime ones, so there is nothing for a
+# composer ecosystem entry to find.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

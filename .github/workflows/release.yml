@@ -1,0 +1,52 @@
+name: Release
+
+# Pushing the tag is the release. Packagist is updated by its own webhook
+# within seconds of the push and needs nothing from here — there is no publish
+# step in a PHP release, and no token for one.
+#
+# This exists to turn the tag into a GitHub release page with notes worth
+# reading, and to refuse if the changelog has nothing to say about it.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  release:
+    name: ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      # Cheap insurance. The tag has already been pushed and cannot be taken
+      # back — tags are never moved here — so it is worth knowing before the
+      # release page exists rather than after.
+      - name: Unit tests
+        run: php tests/unit.php
+
+      - name: Composer metadata is valid
+        run: composer validate --strict
+
+      # Fails when CHANGELOG.md has no section for this version, which is the
+      # one thing that must not be discovered later.
+      - name: Build the release notes
+        run: bin/github-release-notes "${GITHUB_REF_NAME}" > "${RUNNER_TEMP}/notes.md"
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Create the GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file "${RUNNER_TEMP}/notes.md" --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}

@@ -1,0 +1,107 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * The body of a GitHub release, printed to stdout, built from the CHANGELOG
+ * section for one version.
+ *
+ *   bin/github-release-notes v1.2.0
+ *
+ * Not to be confused with bin/changelog-draft, which writes the other half:
+ * that one drafts a CHANGELOG section from commits, this one renders a
+ * finished section into a release page.
+ *
+ * The changelog is the source of truth. This reads the section for one version
+ * and adds the two things a release page needs that a changelog should not
+ * carry: how to install this version, and how to check it worked.
+ *
+ * Deliberately not generated from commit subjects. A release page is read by
+ * someone deciding whether to upgrade a production store today, and "fix:
+ * close the holes the third review round found" answers a different question
+ * than "does this change whether my store ends up patched".
+ */
+
+$tag = $argv[1] ?? '';
+
+if ($tag === '') {
+    fwrite(STDERR, "usage: bin/github-release-notes <tag>\n");
+    exit(1);
+}
+
+$version = ltrim($tag, 'v');
+$root = dirname(__DIR__);
+$changelog = $root . '/CHANGELOG.md';
+
+if (!is_file($changelog)) {
+    fwrite(STDERR, "no CHANGELOG.md at $changelog\n");
+    exit(1);
+}
+
+$lines = explode("\n", (string) file_get_contents($changelog));
+
+$section = [];
+$inSection = false;
+
+foreach ($lines as $line) {
+    if (preg_match('/^## +v?([0-9][^ ]*)/', $line, $m) === 1) {
+        if ($inSection) {
+            break;
+        }
+
+        $inSection = $m[1] === $version;
+        continue;
+    }
+
+    if ($inSection) {
+        $section[] = $line;
+    }
+}
+
+if (!$inSection && $section === []) {
+    fwrite(STDERR, sprintf(
+        "CHANGELOG.md has no section for %s.\n" .
+        "Add one as \"## %s — %s\" before tagging.\n",
+        $version,
+        $version,
+        date('Y-m-d')
+    ));
+    exit(1);
+}
+
+$body = trim(implode("\n", $section));
+
+// A constraint, not the exact version: the point of publishing a patch tool is
+// that stores take the next fix without editing composer.json.
+$major = explode('.', $version)[0];
+$constraint = '^' . $major . '.' . (explode('.', $version)[1] ?? '0');
+
+$install = <<<TEXT
+
+## Installing
+
+```bash
+composer require samjuk/magento-patch-installer:$constraint
+```
+
+Already using it:
+
+```bash
+composer update samjuk/magento-patch-installer
+```
+
+Then confirm the store is where you expect:
+
+```bash
+composer patches:verify
+```
+
+`patches:verify` exits non-zero when a declared patch is not on disk. Run it as
+its own pipeline step rather than relying on the install: `--no-plugins` and a
+missing `allow-plugins` entry both run a whole install and exit 0 having
+applied nothing, and neither can be reported from inside a plugin that never
+ran.
+TEXT;
+
+echo $body . "\n" . $install . "\n";

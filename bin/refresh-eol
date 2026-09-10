@@ -1,0 +1,108 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Rebuilds resources/magento-eol.json from magento.watch.
+ *
+ * The plugin never calls a network service while patching a store — a security
+ * tool that phones home on every `composer install` is a liability, and a store
+ * behind a firewall would silently lose the warning. So the lifecycle dates are
+ * precomputed here and shipped in the package. Run this on a schedule; CI opens
+ * a pull request when the answer changes.
+ *
+ *   bin/refresh-eol            # rewrite the manifest
+ *   bin/refresh-eol --check    # exit 1 if it is out of date, change nothing
+ */
+
+const API = 'https://magento.watch/api/v1';
+
+const DISTRIBUTIONS = [
+    'magento/product-community-edition' => 'magento-community',
+    'magento/product-enterprise-edition' => 'magento-commerce',
+    'mage-os/product-community-edition' => 'mage-os',
+];
+
+$checkOnly = in_array('--check', $argv, true);
+$target = dirname(__DIR__) . '/resources/magento-eol.json';
+
+$fetch = static function (string $url): array {
+    $context = stream_context_create([
+        'http' => [
+            'timeout' => 30,
+            'header' => "User-Agent: samjuk/magento-patch-installer refresh-eol\r\n",
+        ],
+    ]);
+
+    $body = @file_get_contents($url, false, $context);
+
+    if ($body === false) {
+        fwrite(STDERR, "could not fetch $url\n");
+        exit(1);
+    }
+
+    $decoded = json_decode($body, true);
+
+    if (!is_array($decoded) || !isset($decoded['data']) || !is_array($decoded['data'])) {
+        fwrite(STDERR, "unexpected response from $url\n");
+        exit(1);
+    }
+
+    return $decoded['data'];
+};
+
+$manifest = [
+    'source' => 'https://magento.watch',
+    'generated' => gmdate('Y-m-d'),
+    'distributions' => [],
+];
+
+foreach (DISTRIBUTIONS as $package => $slug) {
+    $versions = [];
+
+    foreach ($fetch(API . '/' . $slug . '/versions') as $version => $record) {
+        // Mage-OS publishes no end-of-life dates, so it simply has no entries
+        // and stores running it are never warned. Better than inventing one.
+        if (empty($record['eolDate'])) {
+            continue;
+        }
+
+        $versions[(string) $version] = $record['eolDate'];
+    }
+
+    uksort($versions, 'version_compare');
+    $manifest['distributions'][$package] = $versions;
+
+    fwrite(STDERR, sprintf("%-40s %d dated version(s)\n", $package, count($versions)));
+}
+
+$json = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+
+if ($checkOnly) {
+    $current = is_file($target) ? (string) file_get_contents($target) : '';
+
+    // The generated date changes on every run; compare the data only.
+    $strip = static function (string $body): string {
+        $decoded = json_decode($body, true);
+        unset($decoded['generated']);
+
+        return (string) json_encode($decoded);
+    };
+
+    if ($strip($current) === $strip($json)) {
+        fwrite(STDERR, "manifest is up to date\n");
+        exit(0);
+    }
+
+    fwrite(STDERR, "manifest is out of date — run bin/refresh-eol\n");
+    exit(1);
+}
+
+if (!is_dir(dirname($target)) && !mkdir(dirname($target), 0755, true) && !is_dir(dirname($target))) {
+    fwrite(STDERR, "could not create " . dirname($target) . "\n");
+    exit(1);
+}
+
+file_put_contents($target, $json);
+fwrite(STDERR, "wrote $target\n");

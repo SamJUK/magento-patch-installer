@@ -1,0 +1,95 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * A changelog section to start editing, built from conventional commits.
+ *
+ *   bin/changelog-draft            # since the last tag
+ *   bin/changelog-draft v1.1.0     # since a given tag
+ *
+ * A draft, not the entry. Commit subjects are written for whoever is reading
+ * the diff; a changelog is read by someone deciding whether to upgrade a
+ * production store. This gets the list and the grouping right so the writing
+ * is the only part left.
+ */
+
+$since = $argv[1] ?? null;
+
+if ($since === null) {
+    $describe = [];
+    exec('git describe --tags --abbrev=0 2>/dev/null', $describe, $status);
+    $since = $status === 0 && isset($describe[0]) ? $describe[0] : null;
+}
+
+$range = $since === null ? '' : escapeshellarg($since) . '..HEAD';
+
+$log = [];
+exec('git log --no-merges --format=%s ' . $range, $log);
+
+if ($log === []) {
+    fwrite(STDERR, $since === null ? "no commits\n" : "no commits since $since\n");
+    exit(1);
+}
+
+// Security first, because that is what the entry is read for. `fix` is split
+// out of it only by whether the subject or the body says so — a patch tool's
+// fixes are usually security-relevant, and guessing wrong in the quiet
+// direction is the wrong way to be wrong.
+$buckets = [
+    'Security' => [],
+    'Added' => [],
+    'Changed' => [],
+    'Fixed' => [],
+    'Other' => [],
+];
+
+foreach ($log as $subject) {
+    if (preg_match('/^(\w+)(\([^)]*\))?(!)?: +(.*)$/', $subject, $m) !== 1) {
+        $buckets['Other'][] = $subject;
+        continue;
+    }
+
+    [, $type, , $breaking, $text] = $m;
+
+    $bucket = 'Other';
+
+    if ($type === 'feat') {
+        $bucket = 'Added';
+    } elseif ($type === 'fix') {
+        $bucket = 'Fixed';
+    } elseif (in_array($type, ['refactor', 'perf'], true)) {
+        $bucket = 'Changed';
+    } elseif (in_array($type, ['docs', 'test', 'chore', 'ci', 'build', 'style'], true)) {
+        // Real, but not what someone upgrading a store needs to read.
+        continue;
+    }
+
+    if ($breaking === '!') {
+        $text = '**BREAKING** ' . $text;
+        $bucket = 'Changed';
+    }
+
+    $buckets[$bucket][] = $text;
+}
+
+printf("## %s — %s\n", 'X.Y.Z', date('Y-m-d'));
+
+foreach ($buckets as $name => $entries) {
+    if ($entries === []) {
+        continue;
+    }
+
+    printf("\n### %s\n\n", $name);
+
+    foreach ($entries as $entry) {
+        printf("- %s\n", $entry);
+    }
+}
+
+fwrite(STDERR, sprintf(
+    "\nDraft only. Move anything that changes whether a store ends up patched\n" .
+    "into Security, and rewrite the rest for someone who has not read the diff.\n%s\n",
+    $since === null ? '' : "Range: $since..HEAD"
+));

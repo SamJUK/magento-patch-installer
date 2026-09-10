@@ -1,0 +1,19 @@
+# What a store actually installs. `export-ignore` applies to `git archive`,
+# which is what GitHub builds the zipball from, so this is the dist package —
+# roughly half the repository is development scaffolding with no business on a
+# production server.
+#
+# `--prefer-source` clones the repository and ignores all of this, so the test
+# and demo suites stay available to anyone who wants to run them.
+#
+# resources/ must never be listed here: the EOL manifest is runtime data, and
+# the lifecycle advisories read it from the installed package.
+/.github/           export-ignore
+/bin/               export-ignore
+/demo/              export-ignore
+/docs/              export-ignore
+/tests/             export-ignore
+/.gitattributes     export-ignore
+/.gitignore         export-ignore
+/phpstan.neon       export-ignore
+/CLAUDE.md          export-ignore
