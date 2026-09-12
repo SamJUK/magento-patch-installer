@@ -251,7 +251,7 @@ class Renderer
     }
 
     /**
-     * The header on `patches:status`: the store, before its patches.
+     * The header on `magento-patches:status`: the store, before its patches.
      *
      * @param array<string, mixed> $environment
      *
@@ -405,7 +405,7 @@ class Renderer
         }
 
         return sprintf(
-            '%d target%s not applied — run composer patches:apply',
+            '%d target%s not applied — run composer magento-patches:apply',
             $counts['unapplied'],
             $counts['unapplied'] === 1 ? '' : 's'
         );
@@ -811,7 +811,7 @@ class Renderer
 
         // A target path or a git error can carry bytes that are not valid
         // UTF-8 — a quoted diff header is enough. json_encode then returns
-        // false, (string) false is '', and `patches:verify --json` printed an
+        // false, (string) false is '', and `magento-patches:verify --json` printed an
         // empty document while a security patch was genuinely missing.
         return (string) json_encode(
             $out,

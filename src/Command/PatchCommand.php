@@ -63,7 +63,7 @@ class PatchCommand extends BaseCommand
         }
 
         // A trial has dry-run set precisely so nothing is written; running
-        // patches:apply by hand on that store must not quietly ignore it.
+        // magento-patches:apply by hand on that store must not quietly ignore it.
         // The option only exists on apply. Reading it anywhere else throws
         // "The --dry-run option does not exist" before a single line is
         // printed, which is every command failing at once for one reason.
@@ -151,7 +151,7 @@ class PatchCommand extends BaseCommand
     }
 
     /**
-     * `patches:list` — the catalogue, with nothing read from the working tree.
+     * `magento-patches:list` — the catalogue, with nothing read from the working tree.
      */
     private function catalogue(Patcher $patcher, InputInterface $input, OutputInterface $output): int
     {

@@ -94,10 +94,10 @@ composer update samjuk/magento-patch-installer
 Then confirm the store is where you expect:
 
 ```bash
-composer patches:verify
+composer magento-patches:verify
 ```
 
-`patches:verify` exits non-zero when a declared patch is not on disk. Run it as
+`magento-patches:verify` exits non-zero when a declared patch is not on disk. Run it as
 its own pipeline step rather than relying on the install: `--no-plugins` and a
 missing `allow-plugins` entry both run a whole install and exit 0 having
 applied nothing, and neither can be reported from inside a plugin that never

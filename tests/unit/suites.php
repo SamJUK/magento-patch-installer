@@ -826,7 +826,7 @@ return [
     $issue = Renderer::banner([result(true, [fragment('a.txt', Fragment::APPLICABLE)])], []);
     Assert::contains($issue, '!!! ISSUE', 'punctuation, because CI logs have no colour');
     Assert::contains($issue, '1 target not applied', 'and says what is wrong');
-    Assert::contains($issue, 'composer patches:apply', 'and what to do about it');
+    Assert::contains($issue, 'composer magento-patches:apply', 'and what to do about it');
 
     $conflict = Renderer::banner([result(true, [fragment('a.txt', Fragment::CONFLICT)])], []);
     Assert::contains($conflict, '!!! ISSUE', 'a conflict is an issue too');
@@ -852,7 +852,7 @@ return [
     Assert::case('--json survives bytes that are not valid UTF-8');
     // A quoted diff header is enough to put invalid bytes into a target path,
     // and git's stderr into a reason. json_encode then returns false, and
-    // (string) false is '' — so `patches:verify --json` printed an empty
+    // (string) false is '' — so `magento-patches:verify --json` printed an empty
     // document while a security patch was genuinely missing, and anything
     // parsing the body saw nothing wrong.
     $nasty = result(true, [fragment("vendor/x/\xC3\x28y.php", Fragment::APPLICABLE)]);
