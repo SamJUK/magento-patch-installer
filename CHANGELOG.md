@@ -16,6 +16,20 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 Nothing yet.
 
+## 0.2.0
+
+### Changed
+
+- **Breaking.** Commands renamed from `patches:*` to `magento-patches:*`.
+
+  Composer treats `patch` as an abbreviation of `patches`, so on a store also
+  running vaimo you could not tell which tool a command would reach.
+
+  Update any scripts — they fail loudly, not silently. No aliases.
+
+  Patching on install and update is unaffected; that runs on Composer events,
+  not the command.
+
 ## 0.1.0 — 2026-09-10
 
 ### Other
