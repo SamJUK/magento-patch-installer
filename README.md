@@ -52,19 +52,19 @@ Four commands, split by the question each one answers.
 
 | Command | Question it answers | Writes? |
 | --- | --- | --- |
-| `composer patches:list` | What do these packages offer? | No |
-| `composer patches:status` | Where does this store stand? | No |
-| `composer patches:apply` | Fix whatever is missing | Yes |
-| `composer patches:verify` | Is it safe to deploy? | No |
+| `composer magento-patches:list` | What do these packages offer? | No |
+| `composer magento-patches:status` | Where does this store stand? | No |
+| `composer magento-patches:apply` | Fix whatever is missing | Yes |
+| `composer magento-patches:verify` | Is it safe to deploy? | No |
 
-`patches:apply` also runs automatically at the end of `composer install`, `composer update` and `composer dump-autoload`.
+`magento-patches:apply` also runs automatically at the end of `composer install`, `composer update` and `composer dump-autoload`.
 
-### `composer patches:list`
+### `composer magento-patches:list`
 
 Every patch the trusted packages declare, grouped by package and then by the base version it was built for. It never touches the working tree and never runs git, so it answers on a fresh clone before `composer install` has run.
 
 ```
-$ composer patches:list
+$ composer magento-patches:list
 
   fixtures/patches
 
@@ -80,12 +80,12 @@ $ composer patches:list
 
 Base constraints are still checked, because those come from the lock file rather than from disk, so it says which patches are *for* this install without claiming any are applied. Add `-v` for each patch's description, its source path, and why the ones that do not apply here do not.
 
-### `composer patches:status`
+### `composer magento-patches:status`
 
 The one to run when you are looking at a store. What it is, whether it is still supported, where its patches come from, and every applicable patch classified against the working tree.
 
 ```
-$ composer patches:status
+$ composer magento-patches:status
 
   Magento        magento/product-community-edition 2.4.6-p15
   End of life    2026-08-11 — passed 29 days ago
@@ -116,12 +116,12 @@ It reports and never writes. `-v` adds per-target detail, naming targets whose m
                    outeredge/magento-disable-graphql
 ```
 
-### `composer patches:apply`
+### `composer magento-patches:apply`
 
 Applies whatever is missing. `--dry-run` reports what would change and writes nothing.
 
 ```
-$ composer patches:apply
+$ composer magento-patches:apply
 
 5 patches · 1 applied · 5 in place · 1 for other versions
 
@@ -136,23 +136,23 @@ $ composer patches:apply
 
 Run it again and nothing happens — the second run is the proof that classification is honest rather than the tool re-applying everything each time.
 
-### `composer patches:verify`
+### `composer magento-patches:verify`
 
 Checks only, and the exit code is the point, so this is the one for a deploy pipeline. The report is cut down to what failed.
 
 ```
-$ composer patches:verify
+$ composer magento-patches:verify
 
 5 patches · 5 in place · 1 missing · 1 for other versions
 
   MISSING   FX-0002        Second        2.4.6-p15  0 of 1
       MISSING      magento/module-catalog/etc/module.xml
 
- !!! ISSUE  1 target not applied — run composer patches:apply
+ !!! ISSUE  1 target not applied — run composer magento-patches:apply
 ```
 
 ```sh
-composer patches:verify || echo "this store is not fully patched"
+composer magento-patches:verify || echo "this store is not fully patched"
 ```
 
 It never writes, including to the mirrored copy of a root-mapped file. A store whose vendor copy is patched and whose served copy is not is exactly the drift this exists to report, and repairing it inside `verify` would return `0` for a store serving an unpatched file.
@@ -205,7 +205,7 @@ All four also fail the Composer run itself, including `3`. A configuration error
 
 ## Using verify as a deploy gate
 
-**Run `composer patches:verify` as its own step in your pipeline, after the install, and let a non-zero exit fail the build.**
+**Run `composer magento-patches:verify` as its own step in your pipeline, after the install, and let a non-zero exit fail the build.**
 
 Not because the install-time run is unreliable, but because there are two ordinary ways for it not to happen at all, and neither of them says so:
 
@@ -216,10 +216,10 @@ Both produce a green build over an unpatched store, so a patcher that can be swi
 
 ```yaml
 - run: composer install --no-interaction
-- run: composer patches:verify --no-interaction
+- run: composer magento-patches:verify --no-interaction
 ```
 
-The same step catches a root file going missing between deploys. Anything that re-deploys `magento2-base` without going through Composer — an rsync, a `cp -r` in a Dockerfile, `bin/magento setup:upgrade` — is invisible to this plugin because there is no Composer event to hook. `patches:verify` reads the working tree and will tell you.
+The same step catches a root file going missing between deploys. Anything that re-deploys `magento2-base` without going through Composer — an rsync, a `cp -r` in a Dockerfile, `bin/magento setup:upgrade` — is invisible to this plugin because there is no Composer event to hook. `magento-patches:verify` reads the working tree and will tell you.
 
 ## Declaring Patches
 
@@ -263,7 +263,7 @@ Patches are declared in the root `composer.json`, or in any package named in `tr
 | `source` | Yes | Path to the patch file, inside the declaring package. Traversal out is refused, and remote URLs are not supported |
 | `base` | Yes for `patches` | Base-version marker deciding whether the patch belongs to this install. Inherited from the line for `lines` entries |
 | `label` | No | Short friendly name — `StyleSmuggler`, `Session Reaper` — shown beside the id in every report |
-| `description` | No | Longer prose, shown under `patches:list -v` |
+| `description` | No | Longer prose, shown under `magento-patches:list -v` |
 | `depends` | No | Ids this patch is built on. Not valid in a cumulative line, which derives its own |
 
 **Do not list the modules a patch happens to touch in `base`.** It is a base-version marker and nothing else. Listing modules is exactly what makes a `replace`d module lose an entire patch, and per-target classification already handles missing modules properly.
@@ -344,7 +344,7 @@ Identifiers are an `id`, or `id@line` to be narrower. A bare id matches that id 
 
 A bare id naming a patch that others are built on is refused outright: write `id@line`. A base version published next year that reused the id would otherwise go dark under a reason written about a different Magento release, taking the rest of that line with it.
 
-**A skip removes the patch, it does not merely decline to add it.** On a store built fresh in CI those are the same thing; on a tree that has had `composer install` run against it for six months the patch is already in `vendor/`, and `patches:apply` takes it back off. `patches:status` shows it as `PRESENT` until then, and a reversal that will not apply cleanly is a conflict rather than a forced write.
+**A skip removes the patch, it does not merely decline to add it.** On a store built fresh in CI those are the same thing; on a tree that has had `composer install` run against it for six months the patch is already in `vendor/`, and `magento-patches:apply` takes it back off. `magento-patches:status` shows it as `PRESENT` until then, and a reversal that will not apply cleanly is a conflict rather than a forced write.
 
 This is the one place the plugin removes a patch on its own, so it only happens for one named in your own config with a written reason, it reports every file it touched, and it refuses rather than forces.
 
@@ -383,7 +383,7 @@ Every command ends on a banner, because a wall of green rows with one amber one 
 ```
      OK     59 of 59 targets applied
  !   WARN   59 of 59 targets applied — 1 advisory above needs attention
- !!! ISSUE  8 targets not applied — run composer patches:apply
+ !!! ISSUE  8 targets not applied — run composer magento-patches:apply
 ```
 
 It is coloured, and it says the same thing in punctuation, because CI logs have no colour and that is where it matters most. States that are fine are lower case throughout the report; states that are not are upper case, for the same reason.
@@ -409,7 +409,7 @@ An exit code is not taken as evidence that anything was written: after applying,
 
 **It runs last.** `POST_INSTALL_CMD` and `POST_UPDATE_CMD` at priority `-1000`, which is after `magento-composer-installer` deploys root files at priority 1 and after your own scripts.
 
-It also runs on `composer dump-autoload`, which fires neither of those events. Writing during what looks like a metadata command is deliberate: `vaimo/composer-patches` hooks `pre-autoload-dump`, so a bare `composer dump-autoload` gives it a full reset-and-repatch cycle in a command this plugin would otherwise never be called for. Measured on a real store, that took a green tree to `patches:verify` exiting `1` with no opportunity to heal. With no other patcher installed the run is a no-op.
+It also runs on `composer dump-autoload`, which fires neither of those events. Writing during what looks like a metadata command is deliberate: `vaimo/composer-patches` hooks `pre-autoload-dump`, so a bare `composer dump-autoload` gives it a full reset-and-repatch cycle in a command this plugin would otherwise never be called for. Measured on a real store, that took a green tree to `magento-patches:verify` exiting `1` with no opportunity to heal. With no other patcher installed the run is a no-op.
 
 **Root-mapped files are patched in both places.** For the files `magento2-base` deploys to the project root, the served copy and the package copy are both patched — the first because it is what runs, the second because any future deploy copies it back over the first. The mapping is read from the package's own `extra.map` at runtime, so patch files are never edited to name two locations.
 
@@ -425,7 +425,7 @@ That design is what makes it safe under automated dependency updates:
 - Those tools resolve dependencies without running Composer plugins, so a bot's branch has no patch state, and needs none. The patches are applied by whatever runs `composer install` next.
 - It is per-installation rather than per-project: dev, staging and production each keep their own, describing that machine's working tree rather than the project's source.
 
-So a bot bumping the package that ships your patches needs no special handling. The new patches apply on the next install, and `composer patches:verify` in the pipeline is what tells you whether that happened.
+So a bot bumping the package that ships your patches needs no special handling. The new patches apply on the next install, and `composer magento-patches:verify` in the pipeline is what tells you whether that happened.
 
 ## Coexistence With Other Patch Plugins
 

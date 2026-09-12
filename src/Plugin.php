@@ -63,7 +63,7 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
             // — it runs its full reset-and-repatch cycle while we never
             // execute at all. Measured: a green store, one
             // `composer dump-autoload -o` with vaimo configured, and
-            // patches:verify goes from 0 to 1 with no opportunity to heal.
+            // magento-patches:verify goes from 0 to 1 with no opportunity to heal.
             ScriptEvents::POST_AUTOLOAD_DUMP => [['onAutoloadDump', self::PRIORITY]],
         ];
     }
@@ -166,7 +166,7 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
         // Loud inside 500 lines of composer output is not loud. Failing the run
         // is the only signal a deploy pipeline reliably notices.
         throw new \RuntimeException(
-            'Security patches could not be applied. Run "composer patches:list -v" for detail, '
+            'Security patches could not be applied. Run "composer magento-patches:list -v" for detail, '
             . 'or set extra.magento-patches.allow-unpatched to true to continue anyway.'
         );
     }

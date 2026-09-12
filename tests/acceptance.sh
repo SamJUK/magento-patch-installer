@@ -72,7 +72,7 @@ counted() {
 }
 
 verify_code() {
-    run "cd /var/www/html && composer patches:verify --no-interaction >/dev/null 2>&1; echo \$?"
+    run "cd /var/www/html && composer magento-patches:verify --no-interaction >/dev/null 2>&1; echo \$?"
 }
 
 setup() {
@@ -171,7 +171,7 @@ s_chain() {
     scenario "S4  a patch is refused when what it is built on is missing"
 
     local chained
-    chained=$(run "cd /var/www/html && composer patches:list --no-interaction 2>/dev/null | grep -cE 'FX-000[0-9]'")
+    chained=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null | grep -cE 'FX-000[0-9]'")
 
     if [ "${chained:-0}" -lt 3 ]; then
         printf '    %s-%s S4 skipped (no chain fixture)\n' "$DIM" "$RESET"
@@ -179,7 +179,7 @@ s_chain() {
     fi
 
     checkne "the catalogue says what each is built on" "0" \
-        "$(run "cd /var/www/html && composer patches:list --no-interaction 2>&1 | grep -c 'after FX-0001'")"
+        "$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>&1 | grep -c 'after FX-0001'")"
 
     # Break the prerequisite's context so it cannot apply. Everything built on
     # it is then refused by name, rather than attempted and failing three
@@ -189,7 +189,7 @@ s_chain() {
     run "sed -i '\$ i\\// context broken' /var/www/html/vendor/magento/framework/Escaper.php" >/dev/null
 
     local out
-    out=$(run "cd /var/www/html && composer patches:apply --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:apply --no-interaction 2>&1")
     # Both links, not just the next one: blocking has to be transitive, or the
     # third patch applies to a tree that never received the first.
     check "both later patches are blocked, not just the next one" "2" "$(echo "$out" | grep -c BLOCKED)"
@@ -199,10 +199,10 @@ s_chain() {
     # Read-only mode classifies every patch on its own merits; only an actual
     # apply refuses to run a link whose prerequisite failed.
     check "listing does not pre-emptively block" "0" \
-        "$(run "cd /var/www/html && composer patches:list --no-interaction 2>&1 | grep -c BLOCKED")"
+        "$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>&1 | grep -c BLOCKED")"
 
     run "cp /tmp/chain.orig /var/www/html/vendor/magento/framework/Escaper.php" >/dev/null
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "and recover once it is fixed" "0" "$(verify_code)"
 }
 
@@ -215,7 +215,7 @@ s_state_and_json() {
         "$(run "grep -c sha256 /var/www/html/var/composer-patches/state.json")"
 
     local parsed
-    parsed=$(run "cd /var/www/html && composer patches:verify --json --no-interaction 2>/dev/null | php -r '\$d = json_decode(stream_get_contents(STDIN), true); echo isset(\$d[\"patches\"], \$d[\"exit_code\"]) ? \"ok\" : \"bad\";'")
+    parsed=$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction 2>/dev/null | php -r '\$d = json_decode(stream_get_contents(STDIN), true); echo isset(\$d[\"patches\"], \$d[\"exit_code\"]) ? \"ok\" : \"bad\";'")
     # Nothing but JSON on stdout. Stripping everything before the first `{` here
     # is what hid a config error being printed into the middle of the payload.
     check "json has the expected shape" "ok" "$parsed"
@@ -244,16 +244,16 @@ s_supersede() {
     local target="tests-fixtures/created.txt"
 
     fixture_new_file "$target" "supersedea" "alpha"
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "first patch creates the file" "alpha" "$(run "cat /var/www/html/$target 2>&1")"
 
     fixture_new_file "$target" "supersedeb" "beta"
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "later patch supersedes it" "beta" "$(run "cat /var/www/html/$target 2>&1")"
     check "verify exits clean" "0" "$(verify_code)"
 
     local applied
-    applied=$(counted "patches:apply" "applied")
+    applied=$(counted "magento-patches:apply" "applied")
     check "and does not flip back on the next run" "0" "${applied:-0}"
     check "content still the later one" "beta" "$(run "cat /var/www/html/$target 2>&1")"
 
@@ -261,7 +261,7 @@ s_supersede() {
     check "an unrecognised file conflicts" "2" "$(verify_code)"
     check "and is not overwritten" "hand-written" "$(run "cat /var/www/html/$target 2>&1")"
 
-    run "rm -f /var/www/html/$target && cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "rm -f /var/www/html/$target && cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "removing it lets the patch land again" "0" "$(verify_code)"
 }
 
@@ -281,7 +281,7 @@ s_unapplied_detected() {
     run "sed -i '\$ d' $file" >/dev/null
     check "verify reports unapplied" "1" "$(verify_code)"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "apply heals it" "0" "$(verify_code)"
 }
 
@@ -302,7 +302,7 @@ s_conflict() {
 
     local before after
     before=$(run "md5sum /var/www/html/$file | cut -d' ' -f1")
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     after=$(run "md5sum /var/www/html/$file | cut -d' ' -f1")
     check "file left untouched" "$before" "$after"
 
@@ -363,7 +363,7 @@ s_mapped_directory() {
     fi
 
     fixture_for "$rel" "mappeddir"
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
 
     check "root copy patched" "1" "$(run "grep -c 'patch-probe-mappeddir' /var/www/html/$rel")"
     check "package copy patched" "1" "$(run "grep -c 'patch-probe-mappeddir' /var/www/html/vendor/magento/magento2-base/$rel")"
@@ -388,7 +388,7 @@ s_symlink_strategy() {
     run "cd /var/www/html && rm -f '$rel' && ln -s '/var/www/html/vendor/magento/magento2-base/$rel' '$rel'" >/dev/null
     check "root path is a symlink" "yes" "$(run "test -L /var/www/html/$rel && echo yes")"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
 
     check "content reaches the root path" "1" "$(run "grep -c 'patch-probe-symlinked' /var/www/html/$rel")"
     check "symlink not replaced by a file" "yes" "$(run "test -L /var/www/html/$rel && echo yes")"
@@ -413,7 +413,7 @@ s_hardlink_strategy() {
     check "starts as one inode" "$(run "stat -c %i /var/www/html/vendor/magento/magento2-base/$rel")" \
                                 "$(run "stat -c %i /var/www/html/$rel")"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
 
     check "root copy patched" "1" "$(run "grep -c 'patch-probe-hardlinked' /var/www/html/$rel")"
     check "package copy patched" "1" "$(run "grep -c 'patch-probe-hardlinked' /var/www/html/vendor/magento/magento2-base/$rel")"
@@ -427,7 +427,7 @@ s_file_without_package() {
          printf '<?php\n// line one\n// line two\n' > /var/www/html/vendor/magento/module-not-a-package/File.php" >/dev/null
 
     fixture_for "vendor/magento/module-not-a-package/File.php" "orphan"
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
 
     check "patched despite no package" "1" \
         "$(run "grep -c 'patch-probe-orphan' /var/www/html/vendor/magento/module-not-a-package/File.php")"
@@ -439,7 +439,7 @@ s_replaced_package() {
     run "cd /var/www/html && composer require outeredge/magento-disable-graphql --no-interaction -W" >/dev/null
 
     local listed
-    listed=$(run "cd /var/www/html && composer patches:status -v --no-interaction 2>&1 | grep -c 'replaced by outeredge/magento-disable-graphql'")
+    listed=$(run "cd /var/www/html && composer magento-patches:status -v --no-interaction 2>&1 | grep -c 'replaced by outeredge/magento-disable-graphql'")
 
     if [ "$listed" = "0" ]; then
         printf '    %s-%s S14 no graphql targets on this version\n' "$DIM" "$RESET"
@@ -483,7 +483,7 @@ s_stale_advisory() {
     # the assertion passes or fails depending on where a version string of a
     # given length happens to push the line break.
     local out
-    out=$(run "cd /var/www/html && composer patches:status --no-interaction 2>&1" | tr '\n' ' ' | tr -s ' ')
+    out=$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1" | tr '\n' ' ' | tr -s ' ')
 
     checkne "advisory names the newer release" "0" "$(echo "$out" | grep -c "built for $next")"
     checkne "and says why it matters" "0" "$(echo "$out" | grep -c 'upgrade to receive them')"
@@ -509,16 +509,16 @@ s_reported_problems() {
     '" >/dev/null
 
     local out
-    out=$(run "cd /var/www/html && composer patches:verify --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction 2>&1")
     checkne "the broken declaration is named" "0" "$(echo "$out" | grep -c 'points at a missing file')"
     check "and verify exits with a config error" "3" \
-        "$(run "cd /var/www/html && composer patches:verify --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:verify --no-interaction >/dev/null 2>&1; echo \$?")"
 
     run "cd /var/www/html && cp /tmp/s18.json composer.json" >/dev/null
 
     # Forgetting the trust entry must not look like a clean store either.
     run "cd /var/www/html && composer config --json extra.magento-patches.trust '[]'" >/dev/null
-    out=$(run "cd /var/www/html && composer patches:verify --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction 2>&1")
     checkne "an untrusted patch package is named" "0" "$(echo "$out" | grep -c 'is not trusted')"
 
     run "cd /var/www/html && cp /tmp/s18.json composer.json" >/dev/null
@@ -536,17 +536,17 @@ s_reported_problems() {
         file_put_contents(\"composer.json\", json_encode(\$j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     '" >/dev/null
 
-    out=$(run "cd /var/www/html && composer patches:verify --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction 2>&1")
     checkne "an unreadable patch file is named" "0" "$(echo "$out" | grep -c 'could not be read as a diff')"
     check "and does not pass as a clean store" "3" \
-        "$(run "cd /var/www/html && composer patches:verify --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:verify --no-interaction >/dev/null 2>&1; echo \$?")"
 
     run "cd /var/www/html && cp /tmp/s18.json composer.json" >/dev/null
     check "clean again once restored" "0" "$(verify_code)"
 }
 
 s_dry_run() {
-    scenario "S19 dry-run writes nothing, even from patches:apply"
+    scenario "S19 dry-run writes nothing, even from magento-patches:apply"
 
     local target="vendor/magento/framework/Escaper.php"
     run "cd /var/www/html && cp composer.json /tmp/s19.json && composer config --json extra.magento-patches.dry-run true" >/dev/null
@@ -554,14 +554,14 @@ s_dry_run() {
 
     local before after out
     before=$(run "md5sum /var/www/html/$target | cut -d' ' -f1")
-    out=$(run "cd /var/www/html && composer patches:apply --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:apply --no-interaction 2>&1")
     after=$(run "md5sum /var/www/html/$target | cut -d' ' -f1")
 
-    check "patches:apply left the file alone" "$before" "$after"
+    check "magento-patches:apply left the file alone" "$before" "$after"
     checkne "and said so" "0" "$(echo "$out" | grep -c 'dry run')"
 
     run "cd /var/www/html && cp /tmp/s19.json composer.json" >/dev/null
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "and applies once dry-run is off" "0" "$(verify_code)"
 }
 
@@ -579,7 +579,7 @@ s_read_only() {
 
     fixture_for "$rel" "readonly"
     run "cp /var/www/html/$pkg /tmp/s20.pristine" >/dev/null
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
 
     # Both copies are patched. Put the package copy back exactly as it shipped,
     # so the served file is right and its seed is not. That is drift, and the
@@ -590,17 +590,17 @@ s_read_only() {
     local before after
     before=$(run "md5sum /var/www/html/$pkg | cut -d' ' -f1")
 
-    run "cd /var/www/html && composer patches:status -v --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:status -v --no-interaction" >/dev/null
     after=$(run "md5sum /var/www/html/$pkg | cut -d' ' -f1")
-    check "patches:status wrote nothing" "$before" "$after"
+    check "magento-patches:status wrote nothing" "$before" "$after"
 
     local code
-    code=$(run "cd /var/www/html && composer patches:verify --no-interaction >/dev/null 2>&1; echo \$?")
+    code=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction >/dev/null 2>&1; echo \$?")
     after=$(run "md5sum /var/www/html/$pkg | cut -d' ' -f1")
-    check "patches:verify wrote nothing" "$before" "$after"
+    check "magento-patches:verify wrote nothing" "$before" "$after"
     check "and reported the drift instead of healing it" "1" "$code"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "apply puts the package copy back" "1" "$(run "grep -c 'patch-probe-readonly' /var/www/html/$pkg")"
     check "and verify is clean again" "0" "$(verify_code)"
 
@@ -609,11 +609,11 @@ s_read_only() {
     run "cd /var/www/html && cp composer.json /tmp/s20.json && composer config --json extra.magento-patches.dry-run true" >/dev/null
     run "cp /tmp/s20.pristine /var/www/html/$pkg" >/dev/null
     before=$(run "md5sum /var/www/html/$pkg | cut -d' ' -f1")
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     after=$(run "md5sum /var/www/html/$pkg | cut -d' ' -f1")
     check "dry-run leaves the mirrored copy alone" "$before" "$after"
 
-    run "cd /var/www/html && cp /tmp/s20.json composer.json && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && cp /tmp/s20.json composer.json && composer magento-patches:apply --no-interaction" >/dev/null
     check "and the store is left clean for what follows" "0" "$(verify_code)"
 }
 
@@ -655,17 +655,17 @@ s_json_is_json() {
     '" >/dev/null
 
     check "stdout is still valid json" "ok" \
-        "$(run "cd /var/www/html && composer patches:verify --json --no-interaction 2>/dev/null | php -r 'echo json_decode(stream_get_contents(STDIN), true) === null ? \"bad\" : \"ok\";'")"
+        "$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction 2>/dev/null | php -r 'echo json_decode(stream_get_contents(STDIN), true) === null ? \"bad\" : \"ok\";'")"
     check "the error went to stderr" "1" \
-        "$(run "cd /var/www/html && composer patches:verify --json --no-interaction 2>&1 >/dev/null | grep -c 'points at a missing file'")"
+        "$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction 2>&1 >/dev/null | grep -c 'points at a missing file'")"
     check "and --json exits 3 like the plain form" "3" \
-        "$(run "cd /var/www/html && composer patches:verify --json --no-interaction >/dev/null 2>&1; echo \$?")"
-    check "even for patches:list" "3" \
-        "$(run "cd /var/www/html && composer patches:list --json --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction >/dev/null 2>&1; echo \$?")"
+    check "even for magento-patches:list" "3" \
+        "$(run "cd /var/www/html && composer magento-patches:list --json --no-interaction >/dev/null 2>&1; echo \$?")"
     # The body is what automation reads. It saying 0 while the process says 3 is
     # worse than the field not being there.
     check "and the body agrees with the process" "3" \
-        "$(run "cd /var/www/html && composer patches:verify --json --no-interaction 2>/dev/null | php -r 'echo json_decode(stream_get_contents(STDIN), true)[\"exit_code\"];\"\";'")"
+        "$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction 2>/dev/null | php -r 'echo json_decode(stream_get_contents(STDIN), true)[\"exit_code\"];\"\";'")"
 
     # An unparseable constraint from a trusted package is a config error, not a
     # VersionParser stack trace that fails composer install for every consumer.
@@ -680,7 +680,7 @@ s_json_is_json() {
     '" >/dev/null
 
     local out
-    out=$(run "cd /var/www/html && composer patches:list --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>&1")
     check "no stack trace escapes" "0" "$(echo "$out" | grep -c 'VersionParser')"
     checkne "the bad constraint is named" "0" "$(echo "$out" | grep -c 'unparseable base constraint')"
 
@@ -689,28 +689,28 @@ s_json_is_json() {
 }
 
 s_catalogue() {
-    scenario "S24 patches:list is the catalogue, and never touches the working tree"
+    scenario "S24 magento-patches:list is the catalogue, and never touches the working tree"
 
     local out
-    out=$(run "cd /var/www/html && composer patches:list --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>&1")
     checkne "declares what the trusted package offers" "0" "$(echo "$out" | grep -c 'fixtures/patches')"
     checkne "and says how many apply here" "0" "$(echo "$out" | grep -c 'apply to this install')"
     check "without classifying the working tree" "0" "$(echo "$out" | grep -cE 'in place|MISSING')"
 
     # The real test of the split: the catalogue must not change when the working
-    # tree does. If it did, it would just be patches:status with fewer columns.
+    # tree does. If it did, it would just be magento-patches:status with fewer columns.
     # (Moving vendor/ away would prove it harder and also delete the plugin.)
     local target="vendor/magento/framework/Escaper.php"
     local before after
-    before=$(run "cd /var/www/html && composer patches:list --no-interaction 2>/dev/null")
+    before=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null")
 
     run "sed -i '\$ d' /var/www/html/$target" >/dev/null
-    after=$(run "cd /var/www/html && composer patches:list --no-interaction 2>/dev/null")
+    after=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null")
 
     check "unchanged by a target going missing" "$before" "$after"
     check "while status notices immediately" "1" "$(verify_code)"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "the store is unharmed" "0" "$(verify_code)"
 }
 
@@ -722,7 +722,7 @@ s_selection() {
     # FX-0002 is deliberately the middle link of the three-patch chain the
     # fixture builds, so the cascade has something to take down and the
     # assertion does not depend on which id happens to be listed first.
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
 
     # The file the fixture's middle link patches, and the comment it leaves —
     # both from tests/fixtures/build.php, which writes "/* <name> */".
@@ -743,30 +743,30 @@ s_selection() {
     # line published later that reuses the id cannot go dark under a reason
     # written about a different Magento version.
     local base
-    base=$(run "cd /var/www/html && composer patches:list --no-interaction 2>/dev/null | grep -B20 'FX-0002' | grep -oE '2\.4\.[0-9]+(-p[0-9]+)?' | head -1")
+    base=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null | grep -B20 'FX-0002' | grep -oE '2\.4\.[0-9]+(-p[0-9]+)?' | head -1")
 
     run "cd /var/www/html && composer config --json extra.magento-patches.sources \
         '{\"fixtures/patches\": {\"skip\": {\"FX-0002@$base\": \"breaks our checkout, JIRA-123\"}}}'" >/dev/null
 
     checkne "a scoped skip is accepted" "3" \
-        "$(run "cd /var/www/html && composer patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
 
     # And the unscoped form is refused, because the cascade multiplies it.
     run "cd /var/www/html && composer config --json extra.magento-patches.sources \
         '{\"fixtures/patches\": {\"skip\": {\"FX-0002\": \"unscoped\"}}}'" >/dev/null
     check "an unscoped chain skip is a config error" "3" \
-        "$(run "cd /var/www/html && composer patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
 
     run "cd /var/www/html && composer config --json extra.magento-patches.sources \
         '{\"fixtures/patches\": {\"skip\": {\"FX-0002@$base\": \"breaks our checkout, JIRA-123\"}}}'" >/dev/null
 
     local out
-    out=$(run "cd /var/www/html && composer patches:status --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1")
     checkne "the skipped patch keeps its row" "0" "$(echo "$out" | grep -c SKIPPED)"
     checkne "and carries the reason given" "0" "$(echo "$out" | grep -c 'breaks our checkout')"
     checkne "the banner says so" "0" "$(echo "$out" | grep -c 'switched off by this project')"
     check "but it is not a failure" "0" \
-        "$(run "cd /var/www/html && composer patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
 
     # A skipped link takes the rest of its chain with it, by name.
     checkne "FX-0003 goes with it" "0" "$(echo "$out" | grep -c 'FX-0003')"
@@ -776,23 +776,23 @@ s_selection() {
     # reach the working tree. Without this, an implementation that marked it and
     # applied it anyway would pass every check above.
     run "sed -i '/$marker/d' /var/www/html/$target" >/dev/null
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "and apply does not put it back" "0" "$(run "grep -c '$marker' /var/www/html/$target")"
 
     # The stronger promise: "skipped" has to mean the patch is not there, not
     # merely that it was not applied on top. A long-lived tree already carries
     # it, and only this takes it back off.
-    run "cd /var/www/html && cp /tmp/s25.json composer.json && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && cp /tmp/s25.json composer.json && composer magento-patches:apply --no-interaction" >/dev/null
     check "the patch is back for the next part" "1" "$(run "grep -c '$marker' /var/www/html/$target")"
 
     run "cd /var/www/html && composer config --json extra.magento-patches.sources \
         '{\"fixtures/patches\": {\"skip\": {\"FX-0002@$base\": \"breaks our checkout, JIRA-123\"}}}'" >/dev/null
 
-    out=$(run "cd /var/www/html && composer patches:status --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1")
     checkne "status says it is still present" "0" "$(echo "$out" | grep -c PRESENT)"
     check "and status changed nothing" "1" "$(run "grep -c '$marker' /var/www/html/$target")"
 
-    out=$(run "cd /var/www/html && composer patches:apply --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:apply --no-interaction 2>&1")
     check "apply removes a patch the project switched off" "0" \
         "$(run "grep -c '$marker' /var/www/html/$target")"
     checkne "and says which file it took it out of" "0" "$(echo "$out" | grep -c removed)"
@@ -807,7 +807,7 @@ s_selection() {
     run "cd /var/www/html && composer config --json extra.magento-patches.sources \
         '{\"fixtures/patches\": {\"skip\": {\"NOPE-1\": \"typo\"}}}'" >/dev/null
     check "a skip matching nothing is a config error" "3" \
-        "$(run "cd /var/www/html && composer patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
 
     # The skip removed the patch from disk, so putting the config back is not
     # enough on its own — the next apply is what restores it. That asymmetry is
@@ -815,7 +815,7 @@ s_selection() {
     run "cd /var/www/html && cp /tmp/s25.json composer.json" >/dev/null
     check "still missing until something applies it" "1" "$(verify_code)"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
     check "clean again once applied" "0" "$(verify_code)"
     check "and the cascaded patch came back too" "1" \
         "$(run "grep -c '$cascaded' /var/www/html/$cascaded_target")"
@@ -843,7 +843,7 @@ s_include() {
     local moved out
     moved=$(run "cd /var/www/html && cat /tmp/s26-id.txt")
 
-    out=$(run "cd /var/www/html && composer patches:list --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>&1")
     check "no configuration errors" "0" "$(echo "$out" | grep -c 'Patch configuration')"
     # The assertion that matters: the moved declaration has to still be there.
     # Without it this passes even if include drops the file on the floor, because
@@ -854,10 +854,10 @@ s_include() {
 
     # A named file that is not there is an error, never a shorter list.
     run "cd /var/www/html && composer config --json extra.magento-patches.include '[\"tests-fixtures/gone.json\"]'" >/dev/null
-    out=$(run "cd /var/www/html && composer patches:status --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1")
     checkne "a missing include is named" "0" "$(echo "$out" | grep -c 'gone.json')"
     check "and is a config error" "3" \
-        "$(run "cd /var/www/html && composer patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction >/dev/null 2>&1; echo \$?")"
 
     run "cd /var/www/html && cp /tmp/s26.json composer.json" >/dev/null
     check "clean again once restored" "0" "$(verify_code)"
@@ -867,7 +867,7 @@ s_banner() {
     scenario "S23 the banner says OK, WARN or ISSUE, without needing colour"
 
     local out advisories
-    out=$(run "cd /var/www/html && composer patches:verify --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction 2>&1")
 
     check "a clean store does not shout" "0" "$(echo "$out" | grep -c '!!! ISSUE')"
     checkne "and says everything landed" "0" "$(echo "$out" | grep -c 'targets applied')"
@@ -889,12 +889,12 @@ s_banner() {
 
     run "sed -i '\$ d' /var/www/html/vendor/magento/framework/Escaper.php" >/dev/null
 
-    out=$(run "cd /var/www/html && composer patches:verify --no-interaction 2>&1")
+    out=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction 2>&1")
     checkne "an unpatched store shouts in punctuation" "0" "$(echo "$out" | grep -c '!!! ISSUE')"
-    checkne "and says what to run" "0" "$(echo "$out" | grep -c 'composer patches:apply')"
+    checkne "and says what to run" "0" "$(echo "$out" | grep -c 'composer magento-patches:apply')"
 
-    run "cd /var/www/html && composer patches:apply --no-interaction" >/dev/null
-    out=$(run "cd /var/www/html && composer patches:verify --no-interaction 2>&1")
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    out=$(run "cd /var/www/html && composer magento-patches:verify --no-interaction 2>&1")
     check "quiet again once applied" "0" "$(echo "$out" | grep -c '!!! ISSUE')"
 }
 
@@ -905,7 +905,7 @@ s_fresh_vendor() {
     check "verify exits clean" "0" "$(verify_code)"
 
     local applied
-    applied=$(counted "patches:status" "in place")
+    applied=$(counted "magento-patches:status" "in place")
     checkne "targets in place" "0" "${applied:-0}"
 }
 
@@ -913,7 +913,7 @@ s_coexistence() {
     scenario "S13 coexists with vaimo/composer-patches"
 
     local ours theirs
-    ours=$(run "cd /var/www/html && composer list --no-interaction 2>/dev/null | grep -c 'patches:verify'")
+    ours=$(run "cd /var/www/html && composer list --no-interaction 2>/dev/null | grep -c 'magento-patches:verify'")
     theirs=$(run "cd /var/www/html && composer list --no-interaction 2>/dev/null | grep -c 'patch:redo'")
 
     check "our commands registered" "1" "$ours"

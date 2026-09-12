@@ -108,7 +108,7 @@ class Patcher
             // The catalogue never runs runOne(), so it never saw an unreadable
             // patch file. It printed "0 targets — applies here" and exited 0,
             // while status and verify called the same file a config error and
-            // exited 3. patches:list is the command someone runs on a fresh
+            // exited 3. magento-patches:list is the command someone runs on a fresh
             // clone while deciding whether to trust a package, which is exactly
             // where a truncated patch most needs to be visible.
             if ($mismatch === null && $targets === 0) {
@@ -421,7 +421,7 @@ class Patcher
             }
 
             if (!$apply) {
-                $fragment->resolve(Fragment::UNWANTED, 'still present; patches:apply will remove it');
+                $fragment->resolve(Fragment::UNWANTED, 'still present; magento-patches:apply will remove it');
                 continue;
             }
 
@@ -946,7 +946,7 @@ class Patcher
      * Read-only callers get the same verdict and no writes. That distinction is
      * not cosmetic: a store whose vendor copy is patched and whose root copy was
      * wiped by a magento2-base reinstall is exactly the drift this plugin exists
-     * to report, and quietly healing it inside `patches:verify` would return 0
+     * to report, and quietly healing it inside `magento-patches:verify` would return 0
      * for a store that is serving an unpatched file.
      */
     private function reconcile(

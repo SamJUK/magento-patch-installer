@@ -955,7 +955,7 @@ return [
     Assert::contains($collector->errors()[0], 'cumulative line', 'and says which rule it broke');
 
     Assert::case('the catalogue refuses to call an unreadable patch applicable');
-    // patches:list never runs runOne(), so it never saw an empty or truncated
+    // magento-patches:list never runs runOne(), so it never saw an empty or truncated
     // diff: it printed "0 targets — applies here" and exited 0, while status
     // and verify called the same file a config error and exited 3.
     $p = $project('catalogue-unreadable')
@@ -972,7 +972,7 @@ return [
 
     Assert::case('the catalogue names what each patch depends on');
     // `depends` holds owner-scoped origin strings, not indices. Typed as int,
-    // this was a TypeError out of patches:list — and patches:list is the one
+    // this was a TypeError out of magento-patches:list — and magento-patches:list is the one
     // command that answers before anything is installed, so a crash there is
     // the first thing anyone evaluating the package sees.
     $p = $project('catalogue-depends')

@@ -251,17 +251,17 @@ trial() {
 
     echo "$out" | grep -A2 "Magento security patches" | sed 's/^/  /'
     echo
-    compose patches:list -v --no-interaction 2>&1 | sed 's/^/  /'
+    compose magento-patches:list -v --no-interaction 2>&1 | sed 's/^/  /'
 
-    compose patches:verify --no-interaction >/dev/null 2>&1
+    compose magento-patches:verify --no-interaction >/dev/null 2>&1
     local code=$?
 
     echo
     case "$code" in
-        0) ok "patches:verify exit 0 — everything applicable is in place" ;;
-        1) warn "patches:verify exit 1 — applicable patches are not applied (expected on a dry run)" ;;
-        2) bad "patches:verify exit 2 — conflict, look at the detail above" ;;
-        *) bad "patches:verify exit $code" ;;
+        0) ok "magento-patches:verify exit 0 — everything applicable is in place" ;;
+        1) warn "magento-patches:verify exit 1 — applicable patches are not applied (expected on a dry run)" ;;
+        2) bad "magento-patches:verify exit 2 — conflict, look at the detail above" ;;
+        *) bad "magento-patches:verify exit $code" ;;
     esac
 
     # Did we disturb anything the other patcher had done?

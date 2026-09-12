@@ -44,7 +44,7 @@ class Collector
     public function collect(): array
     {
         // Nothing about a package's declarations changes within a run, and
-        // patches:status asks three times. Splitting and re-validating a large
+        // magento-patches:status asks three times. Splitting and re-validating a large
         // manifest for each caller is pure repetition — and it is the caller
         // count that turned a slow collect() into a slow composer install.
         if ($this->collected !== null) {
