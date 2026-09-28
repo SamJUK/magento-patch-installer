@@ -12,7 +12,7 @@ declare(strict_types=1);
  * precomputed here and shipped in the package. Run this on a schedule; CI opens
  * a pull request when the answer changes.
  *
- *   bin/refresh-eol            # rewrite the manifest
+ *   bin/refresh-eol            # rewrite the manifest if any date moved
  *   bin/refresh-eol --check    # exit 1 if it is out of date, change nothing
  */
 
@@ -78,23 +78,23 @@ foreach (DISTRIBUTIONS as $package => $slug) {
 }
 
 $json = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+$current = is_file($target) ? (string) file_get_contents($target) : '';
+
+// The generated date changes on every run; compare the data only, or CI opens
+// a pull request every week that moves nothing but the date.
+$strip = static function (string $body): string {
+    $decoded = json_decode($body, true);
+    unset($decoded['generated']);
+
+    return (string) json_encode($decoded);
+};
+
+if ($strip($current) === $strip($json)) {
+    fwrite(STDERR, "manifest is up to date\n");
+    exit(0);
+}
 
 if ($checkOnly) {
-    $current = is_file($target) ? (string) file_get_contents($target) : '';
-
-    // The generated date changes on every run; compare the data only.
-    $strip = static function (string $body): string {
-        $decoded = json_decode($body, true);
-        unset($decoded['generated']);
-
-        return (string) json_encode($decoded);
-    };
-
-    if ($strip($current) === $strip($json)) {
-        fwrite(STDERR, "manifest is up to date\n");
-        exit(0);
-    }
-
     fwrite(STDERR, "manifest is out of date — run bin/refresh-eol\n");
     exit(1);
 }
