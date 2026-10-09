@@ -64,6 +64,12 @@ Worth knowing for the run where something goes sideways.
    no section for the version, which is the one thing that must not be found
    out after a tag exists.
 
+   It also appends a **Contributors** line of @mentions (commit authors since
+   the previous tag, bots excluded) and a **Full changelog** compare link. The
+   @mentions are what give the release page its contributors strip. The page
+   itself is authored by `github-actions`, because the workflow creates it; a
+   release made by hand needs both lines added by hand.
+
 5. **Confirm Packagist has it** at
    [packagist.org/packages/samjuk/magento-patch-installer](https://packagist.org/packages/samjuk/magento-patch-installer).
    It should appear within seconds; if it has not, the GitHub webhook is
