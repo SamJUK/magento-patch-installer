@@ -14,6 +14,10 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.1 — 2026-10-09
+
 ### Fixed
 
 - A month that edits lines an earlier month added made the earlier one read as a
