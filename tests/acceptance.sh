@@ -863,6 +863,130 @@ s_include() {
     check "clean again once restored" "0" "$(verify_code)"
 }
 
+# Writes tests-fixtures/<name>.patch from file <from> to file <to>, naming <rel>.
+fixture_step() {
+    local from="$1" to="$2" rel="$3" name="$4"
+
+    run "cd /var/www/html && diff -u '$from' '$to' | sed '1s|.*|--- a/$rel|; 2s|.*|+++ b/$rel|' > tests-fixtures/$name.patch" >/dev/null
+}
+
+s_overlap() {
+    scenario "S28 a later link that rewrites an earlier link's lines leaves both in place"
+
+    run "cd /var/www/html && cp composer.json /tmp/s28.json" >/dev/null
+
+    local base
+    base=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null | grep -B20 'FX-0002' | grep -oE '2\.4\.[0-9]+(-p[0-9]+)?' | head -1")
+
+    # Three links, each rewriting the line the one before added.
+    local target="vendor/magento/module-cms/etc/module.xml"
+    run "cd /var/www/html
+         cp $target /tmp/ovl.0
+         { cat /tmp/ovl.0; echo '<!-- overlap-one -->'; } > /tmp/ovl.1
+         sed 's/overlap-one/overlap-two/' /tmp/ovl.1 > /tmp/ovl.2
+         sed 's/overlap-two/overlap-three/' /tmp/ovl.2 > /tmp/ovl.3" >/dev/null
+    fixture_step /tmp/ovl.0 /tmp/ovl.1 "$target" overlap-1
+    fixture_step /tmp/ovl.1 /tmp/ovl.2 "$target" overlap-2
+    fixture_step /tmp/ovl.2 /tmp/ovl.3 "$target" overlap-3
+
+    # Two links on a root-mapped file, one naming each copy.
+    local rel
+    rel=$(mapped_file 4)
+    local vendor="vendor/magento/magento2-base/$rel"
+    run "cd /var/www/html
+         cp $rel /tmp/mir.0
+         { cat /tmp/mir.0; printf '\n/* overlap-mirror-one */\n'; } > /tmp/mir.1
+         sed 's/overlap-mirror-one/overlap-mirror-two/' /tmp/mir.1 > /tmp/mir.2" >/dev/null
+    fixture_step /tmp/mir.0 /tmp/mir.1 "$vendor" mirror-1
+    fixture_step /tmp/mir.1 /tmp/mir.2 "$rel" mirror-2
+
+    # Cumulative line for one, explicit `depends` for the other.
+    run "cd /var/www/html && php -r '
+        \$j = json_decode(file_get_contents(\"composer.json\"), true);
+        \$base = [\"magento/magento2-base\" => \"$base\"];
+        \$j[\"extra\"][\"magento-patches\"][\"lines\"][\"$base\"] = [
+            \"base\" => \$base,
+            \"cumulative\" => true,
+            \"patches\" => [
+                [\"id\" => \"OVL-1\", \"source\" => \"tests-fixtures/overlap-1.patch\"],
+                [\"id\" => \"OVL-2\", \"source\" => \"tests-fixtures/overlap-2.patch\"],
+                [\"id\" => \"OVL-3\", \"source\" => \"tests-fixtures/overlap-3.patch\"],
+            ],
+        ];
+        \$j[\"extra\"][\"magento-patches\"][\"patches\"][] =
+            [\"id\" => \"MIR-1\", \"source\" => \"tests-fixtures/mirror-1.patch\", \"base\" => \$base];
+        \$j[\"extra\"][\"magento-patches\"][\"patches\"][] =
+            [\"id\" => \"MIR-2\", \"source\" => \"tests-fixtures/mirror-2.patch\", \"base\" => \$base, \"depends\" => [\"MIR-1\"]];
+        file_put_contents(\"composer.json\", json_encode(\$j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    '" >/dev/null
+
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "the last link's line is what is on disk" "1" "$(run "grep -c overlap-three /var/www/html/$target")"
+
+    # Was 2: OVL-1 and OVL-2 matched neither side once OVL-3 landed.
+    check "verify exits clean on the run after" "0" "$(verify_code)"
+    check "and no link reads as a conflict" "0" \
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1 | grep -c CONFLICT")"
+    check "composer install still succeeds" "0" \
+        "$(run "cd /var/www/html && composer install --no-interaction >/dev/null 2>&1; echo \$?")"
+
+    check "root copy carries the later link" "1" "$(run "grep -c overlap-mirror-two /var/www/html/$rel")"
+    check "and so does magento2-base's" "1" "$(run "grep -c overlap-mirror-two /var/www/html/$vendor")"
+
+    # Peeling must not hide a missing link.
+    run "cp /tmp/ovl.2 /var/www/html/$target" >/dev/null
+    check "a missing top link is still missing" "1" "$(verify_code)"
+    # OVL-3's context is OVL-2's line: missing, not a conflict.
+    run "cp /tmp/ovl.1 /var/www/html/$target" >/dev/null
+    check "and two missing is missing, not a conflict" "1" "$(verify_code)"
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "apply puts them back in order" "same" \
+        "$(run "cmp -s /tmp/ovl.3 /var/www/html/$target && echo same")"
+
+    # Nor a hand edit.
+    run "sed -i 's/overlap-three/hand-edited/' /var/www/html/$target" >/dev/null
+    check "a hand edit over the chain conflicts" "2" "$(verify_code)"
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "and is not overwritten" "1" "$(run "grep -c hand-edited /var/www/html/$target")"
+    run "cp /tmp/ovl.3 /var/www/html/$target" >/dev/null
+
+    # Skipping the middle link cascades to the top; both must reverse cleanly.
+    local owner
+    owner=$(run "cd /var/www/html && composer magento-patches:list --json --no-interaction 2>/dev/null | php -r '
+        foreach (json_decode(stream_get_contents(STDIN), true)[\"patches\"] as \$p) {
+            if (\$p[\"id\"] === \"OVL-1\") { echo \$p[\"owner\"]; break; }
+        }'")
+    run "cd /var/www/html && cp composer.json /tmp/s28-unskipped.json" >/dev/null
+    run "cd /var/www/html && composer config --json extra.magento-patches.sources \
+        '{\"$owner\": {\"skip\": {\"OVL-2@$base\": \"testing the cascade\"}}}'" >/dev/null
+
+    local out
+    out=$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1")
+    check "a skip over a stacked link is not read as a conflict" "0" "$(echo "$out" | grep -c CONFLICT)"
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "apply takes both off, top first" "same" \
+        "$(run "cmp -s /tmp/ovl.1 /var/www/html/$target && echo same")"
+    check "and the store is clean with them off" "0" "$(verify_code)"
+
+    run "cd /var/www/html && cp /tmp/s28-unskipped.json composer.json" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "lifting the skip restores the chain" "same" \
+        "$(run "cmp -s /tmp/ovl.3 /var/www/html/$target && echo same")"
+
+    # Reinstall wipes both copies; the chain must come back across them.
+    run "cd /var/www/html && composer reinstall magento/magento2-base --no-interaction" >/dev/null
+    check "reinstall heals the mixed-copy chain" "0" "$(verify_code)"
+    check "both copies agree afterwards" "same" \
+        "$(run "cd /var/www/html && cmp -s $rel $vendor && cmp -s $rel /tmp/mir.2 && echo same")"
+
+    run "cd /var/www/html
+         cp /tmp/s28.json composer.json
+         cp /tmp/ovl.0 $target
+         cp /tmp/mir.0 $rel
+         cp /tmp/mir.0 $vendor" >/dev/null
+    check "clean again once restored" "0" "$(verify_code)"
+}
+
 s_banner() {
     scenario "S23 the banner says OK, WARN or ISSUE, without needing colour"
 
@@ -991,6 +1115,7 @@ run_image() {
     s_catalogue
     s_selection
     s_include
+    s_overlap
     s_banner
     s_dump_autoload
     s_fresh_vendor

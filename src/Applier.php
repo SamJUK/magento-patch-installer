@@ -26,6 +26,9 @@ class Applier
     /** @var string|null */
     private $tempDir;
 
+    /** @var string per instance, so a scratch view cannot overwrite it */
+    private $lastError = '';
+
     public function __construct(ProcessExecutor $process, string $projectRoot)
     {
         $this->process = $process;
@@ -49,6 +52,58 @@ class Applier
         return $this->run($diff, ['-R', '--check']) === 0;
     }
 
+    /**
+     * Applied, once the later diffs stacked on the same file are peeled off a scratch copy?
+     *
+     * @param string[] $above later diffs for $path, in apply order
+     */
+    public function isAppliedBeneath(string $diff, string $path, array $above): bool
+    {
+        if ($this->isApplied($diff)) {
+            return true;
+        }
+
+        if ($above === []) {
+            return false;
+        }
+
+        return $this->inScratch($path, static function (self $view, callable $local) use ($diff, $above): bool {
+            foreach (array_reverse($above) as $later) {
+                if ($view->isApplied($later = $local($later))) {
+                    $view->revert($later);
+                }
+            }
+
+            return $view->isApplied($local($diff));
+        });
+    }
+
+    /**
+     * Applicable, once the earlier diffs it is built on are put back on a scratch copy?
+     *
+     * @param string[] $below earlier diffs for $path, in apply order
+     */
+    public function canApplyAbove(string $diff, string $path, array $below): bool
+    {
+        if ($this->canApply($diff)) {
+            return true;
+        }
+
+        if ($below === []) {
+            return false;
+        }
+
+        return $this->inScratch($path, static function (self $view, callable $local) use ($diff, $below): bool {
+            foreach ($below as $earlier) {
+                if (!$view->isApplied($earlier = $local($earlier)) && $view->canApply($earlier)) {
+                    $view->apply($earlier);
+                }
+            }
+
+            return $view->canApply($local($diff));
+        });
+    }
+
     public function apply(string $diff): bool
     {
         return $this->run($diff, []) === 0;
@@ -61,7 +116,7 @@ class Applier
 
     public function lastError(): string
     {
-        return trim($this->process->getErrorOutput());
+        return $this->lastError;
     }
 
     /**
@@ -128,7 +183,10 @@ class Applier
         );
 
         try {
-            return $this->process->execute($command, $output, $this->projectRoot);
+            $code = $this->process->execute($command, $output, $this->projectRoot);
+            $this->lastError = trim($this->process->getErrorOutput());
+
+            return $code;
         } finally {
             @unlink($file);
         }
@@ -137,17 +195,7 @@ class Applier
     private function write(string $diff): string
     {
         if ($this->tempDir === null) {
-            // A predictable name a local user could pre-create — or point at a
-            // directory they own — would let them swap the diff between it
-            // being written and git reading it. Refuse anything we did not just
-            // create ourselves.
-            $dir = sys_get_temp_dir() . '/magento-patch-installer-' . bin2hex(random_bytes(8));
-
-            if (!@mkdir($dir, 0700)) {
-                throw new \RuntimeException('Unable to create a temporary directory at ' . $dir);
-            }
-
-            $this->tempDir = $dir;
+            $this->tempDir = $this->makeTempDir();
         }
 
         $file = $this->tempDir . '/' . bin2hex(random_bytes(8)) . '.patch';
@@ -157,5 +205,46 @@ class Applier
         }
 
         return $file;
+    }
+
+    private function makeTempDir(): string
+    {
+        // A predictable name a local user could pre-create — or point at a
+        // directory they own — would let them swap the diff between it
+        // being written and git reading it. Refuse anything we did not just
+        // create ourselves.
+        $dir = sys_get_temp_dir() . '/magento-patch-installer-' . bin2hex(random_bytes(8));
+
+        if (!@mkdir($dir, 0700)) {
+            throw new \RuntimeException('Unable to create a temporary directory at ' . $dir);
+        }
+
+        return $dir;
+    }
+
+    /**
+     * Ask a question of a throwaway copy of $path, named "view".
+     *
+     * @param callable(self, callable(string): string): bool $question gets the view and a diff retargeter
+     */
+    private function inScratch(string $path, callable $question): bool
+    {
+        $source = $this->projectRoot . '/' . $path;
+
+        if (!is_file($source)) {
+            return false;
+        }
+
+        $scratch = $this->makeTempDir();
+        $local = function (string $diff) use ($path): string {
+            return $this->retarget($diff, $path, 'view');
+        };
+
+        try {
+            return @copy($source, $scratch . '/view') && $question(new self($this->process, $scratch), $local);
+        } finally {
+            @unlink($scratch . '/view');
+            @rmdir($scratch);
+        }
     }
 }

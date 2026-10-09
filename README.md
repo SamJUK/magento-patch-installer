@@ -272,7 +272,7 @@ Patches are declared in the root `composer.json`, or in any package named in `tr
 
 Most patches do not care what order they apply in, and the plugin does not invent one. Two things change that.
 
-**A cumulative line.** Adobe's monthly patches each build on the one before, and nothing in their content reveals it — today's monthly patches touch entirely disjoint files, so any order applies cleanly. Mark the line and the order you list them in *is* the chain:
+**A cumulative line.** Adobe's monthly patches each build on the one before, and nothing in their content reveals it — most of a month's files are its own, so most orders apply cleanly. Mark the line and the order you list them in *is* the chain:
 
 ```json
 "2.4.8-p5": {
@@ -400,6 +400,8 @@ It is coloured, and it says the same thing in punctuation, because CI logs have 
 | fails | passes | Applicable, apply it |
 | fails | fails, file absent | Not applicable, say why |
 | fails | fails, file present | Conflict — reported, never overwritten |
+
+**Chains are checked as chains.** A later link can rewrite an earlier one's lines, so "already applied" is asked on a scratch copy with the later links taken off, and a report asks "can apply" with the earlier links put back. Root and package copies of a mapped file count as one file. Patches not linked by `depends` or a cumulative line are checked alone.
 
 The reverse check is asked first and wins outright. A hunk whose context is ordinary boilerplate can match at more than one offset, so on an already-patched file the forward check passes too, and applying again duplicates the change.
 
