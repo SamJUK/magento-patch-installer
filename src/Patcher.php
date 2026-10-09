@@ -53,6 +53,15 @@ class Patcher
     /** @var array<string, Fragment[]> patch source => fragments */
     private $splits = [];
 
+    /** @var array<int, array<string, Fragment[]>> declaration => file key => later links built on it */
+    private $above = [];
+
+    /** @var array<int, array<string, Fragment[]>> declaration => file key => earlier links it is built on */
+    private $below = [];
+
+    /** @var bool */
+    private $applying = false;
+
     public function __construct(Composer $composer, ProcessExecutor $process)
     {
         $this->composer = $composer;
@@ -266,6 +275,8 @@ class Patcher
         $declarations = $this->collector->collect();
 
         $lastCreator = $this->lastCreators($declarations);
+        $this->applying = $apply;
+        $this->stacks($declarations);
 
         // Reversals run first, and in reverse dependency order. A patch cannot
         // come off while another sits on top of it, so walking forward — the
@@ -273,7 +284,7 @@ class Patcher
         // until a second run, and calls the store clean in between.
         $reversals = [];
 
-        foreach (array_reverse($declarations) as $declaration) {
+        foreach (array_reverse($declarations, true) as $index => $declaration) {
             if (($declaration['skipped'] ?? null) === null || $this->baseMismatch($declaration['base']) !== null) {
                 continue;
             }
@@ -282,7 +293,7 @@ class Patcher
                 'applicable' => false,
                 'blocked' => false,
                 'reason' => $declaration['skipped'],
-                'fragments' => $this->unwanted($declaration, $apply),
+                'fragments' => $this->unwanted($declaration, $apply, $index),
             ]);
         }
 
@@ -379,7 +390,7 @@ class Patcher
      *
      * @return Fragment[]
      */
-    private function unwanted(array $declaration, bool $apply): array
+    private function unwanted(array $declaration, bool $apply, int $index): array
     {
         $fragments = $this->fragments($declaration);
         $removed = false;
@@ -400,15 +411,20 @@ class Patcher
             // magento2-base deploy leaves the patch in the served copy and not
             // the package one, and looking only at the primary calls that
             // "already gone".
-            $here = $this->applier->isApplied($diff);
-            $there = $mirrorDiff !== null && $this->applier->isApplied($mirrorDiff);
+            $here = $this->applier->isAppliedBeneath($diff, $primary, $this->above($index, $target, $primary));
+            $there = $mirror !== null && $mirrorDiff !== null
+                && $this->applier->isAppliedBeneath($mirrorDiff, $mirror, $this->above($index, $target, $mirror));
 
             if (!$here && !$there) {
                 // Absent is only one of the reasons a reverse-check fails. The
                 // others — local edits, another patch stacked on top — mean
                 // nobody can say whether it is there, and reporting that as
                 // "not present" leaves the store running it.
-                if (file_exists($this->resolver->absolute($primary)) && !$this->applier->canApply($diff)) {
+                // Asked with the links it is built on put back: they are usually skipped and gone too.
+                if (
+                    file_exists($this->resolver->absolute($primary))
+                    && !$this->applier->canApplyAbove($diff, $primary, $this->below($index, $target, $primary))
+                ) {
                     $fragment->resolve(
                         Fragment::CONFLICT,
                         'cannot tell whether it is applied: ' . $this->applier->lastError()
@@ -592,6 +608,93 @@ class Patcher
     }
 
     /**
+     * For each patch, the same-file fragments of the patches built on it (above) and that it is built on
+     * (below), so a chain is checked as a chain. Unrelated patches never stack; file creations are left
+     * to the supersede logic.
+     *
+     * @param array<int, array<string, mixed>> $declarations in apply order
+     */
+    private function stacks(array $declarations): void
+    {
+        $indexOf = $builtOn = $modifies = [];
+
+        foreach ($declarations as $index => $declaration) {
+            $indexOf[$declaration['origin']] = $index;
+            $builtOn[$index] = [];
+
+            foreach ($declaration['depends'] as $origin) {
+                if (isset($indexOf[$origin])) {
+                    $builtOn[$index] += [$indexOf[$origin] => true] + $builtOn[$indexOf[$origin]];
+                }
+            }
+
+            if ($this->baseMismatch($declaration['base']) !== null) {
+                continue;
+            }
+
+            foreach ($this->fragments($declaration) as $fragment) {
+                if (!$fragment->createsFile()) {
+                    $modifies[$index][$this->fileKey($fragment->target())][] = $fragment;
+                }
+            }
+        }
+
+        $this->above = $this->below = [];
+
+        foreach ($builtOn as $index => $earlier) {
+            ksort($earlier);
+
+            foreach (array_keys($earlier) as $prior) {
+                foreach ($modifies[$index] ?? [] as $key => $fragments) {
+                    $this->above[$prior][$key] = array_merge($this->above[$prior][$key] ?? [], $fragments);
+                }
+
+                foreach ($modifies[$prior] ?? [] as $key => $fragments) {
+                    $this->below[$index][$key] = array_merge($this->below[$index][$key] ?? [], $fragments);
+                }
+            }
+        }
+    }
+
+    /**
+     * @return string[] diffs of later links that edit $target, aimed at $path
+     */
+    private function above(int $index, string $target, string $path): array
+    {
+        return $this->aimed($this->above[$index][$this->fileKey($target)] ?? [], $path);
+    }
+
+    /**
+     * @return string[] diffs of earlier links that edit $target, aimed at $path
+     */
+    private function below(int $index, string $target, string $path): array
+    {
+        return $this->aimed($this->below[$index][$this->fileKey($target)] ?? [], $path);
+    }
+
+    /**
+     * @param Fragment[] $fragments
+     *
+     * @return string[]
+     */
+    private function aimed(array $fragments, string $path): array
+    {
+        return array_map(function (Fragment $fragment) use ($path): string {
+            return $fragment->target() === $path
+                ? $fragment->diff()
+                : $this->applier->retarget($fragment->diff(), $fragment->target(), $path);
+        }, $fragments);
+    }
+
+    /** Root copy and package copy of a root-mapped file are one file, whichever a hunk names. */
+    private function fileKey(string $target): string
+    {
+        $mirror = $this->resolver->mirrorFor($target);
+
+        return $mirror === null || strcmp($target, $mirror) < 0 ? $target : $mirror;
+    }
+
+    /**
      * Split a patch once and reuse it: the pre-pass and the run itself look at
      * the same Fragment objects.
      *
@@ -698,9 +801,9 @@ class Patcher
         // replaced, not installed, or does not ship the file — is not a
         // refusal: those are expected on any real store and must not take the
         // rest of the patch down with them.
-        if ($apply && $this->refusals($declaration, $superseded) !== []) {
+        if ($apply && $this->refusals($declaration, $superseded, $index) !== []) {
             foreach ($fragments as $position => $fragment) {
-                $this->handle($fragment, false, $declaration['owner'], $superseded[$position]);
+                $this->handle($fragment, false, $declaration['owner'], $superseded[$position], $index);
                 $result['fragments'][] = $fragment;
             }
 
@@ -708,7 +811,7 @@ class Patcher
         }
 
         foreach ($fragments as $position => $fragment) {
-            $this->handle($fragment, $apply, $declaration['owner'], $superseded[$position]);
+            $this->handle($fragment, $apply, $declaration['owner'], $superseded[$position], $index);
             $result['fragments'][] = $fragment;
 
             // Pre-flight said every fragment would apply, so a failure here is
@@ -741,12 +844,12 @@ class Patcher
      *
      * @return string[]
      */
-    private function refusals(array $declaration, array $superseded): array
+    private function refusals(array $declaration, array $superseded, int $index): array
     {
         $refused = [];
 
         foreach ($this->fragments($declaration) as $position => $fragment) {
-            $this->handle($fragment, false, $declaration['owner'], $superseded[$position] ?? false);
+            $this->handle($fragment, false, $declaration['owner'], $superseded[$position] ?? false, $index);
 
             if ($fragment->isFailure()) {
                 $refused[] = $fragment->target();
@@ -791,7 +894,7 @@ class Patcher
         }
     }
 
-    private function handle(Fragment $fragment, bool $apply, string $owner, bool $superseded = false): void
+    private function handle(Fragment $fragment, bool $apply, string $owner, bool $superseded, int $index): void
     {
         if ($superseded) {
             $fragment->resolve(Fragment::NOT_APPLICABLE, 'superseded by a later patch in this line');
@@ -815,14 +918,20 @@ class Patcher
         // nginx `location` block is a live example — so on an already-patched
         // file the forward check also passes, and applying again duplicates the
         // change. "Is it already there" is the question that decides.
-        if ($this->applier->isApplied($diff)) {
+        // Asked beneath later links in the chain, which may have rewritten its lines.
+        if ($this->applier->isAppliedBeneath($diff, $primary, $this->above($index, $target, $primary))) {
             $fragment->resolve(Fragment::ALREADY);
-            $this->reconcile($fragment, $primary, $mirror, $before, $linked, $apply);
+            $this->reconcile($fragment, $primary, $mirror, $before, $linked, $apply, $index);
 
             return;
         }
 
-        if ($this->applier->canApply($diff)) {
+        // A report puts earlier links back first, as an apply would. An apply asks the real file.
+        $applicable = $this->applying
+            ? $this->applier->canApply($diff)
+            : $this->applier->canApplyAbove($diff, $primary, $this->below($index, $target, $primary));
+
+        if ($applicable) {
             if (!$apply) {
                 $fragment->resolve(Fragment::APPLICABLE);
 
@@ -853,7 +962,7 @@ class Patcher
 
             $fragment->resolve(Fragment::APPLIED);
             $fragment->recordWrite($primary);
-            $this->reconcile($fragment, $primary, $mirror, $before, $linked, true);
+            $this->reconcile($fragment, $primary, $mirror, $before, $linked, true, $index);
 
             return;
         }
@@ -915,7 +1024,7 @@ class Patcher
                     @unlink($aside);
                     $fragment->resolve(Fragment::SUPERSEDED);
                     $fragment->recordWrite($primary);
-                    $this->reconcile($fragment, $primary, $mirror, $before, $linked, true);
+                    $this->reconcile($fragment, $primary, $mirror, $before, $linked, true, $index);
 
                     return;
                 }
@@ -955,7 +1064,8 @@ class Patcher
         ?string $mirror,
         ?string $before,
         bool $linked,
-        bool $apply
+        bool $apply,
+        int $index
     ): void {
         if ($mirror === null) {
             return;
@@ -1014,11 +1124,16 @@ class Patcher
 
         $mirrorDiff = $this->applier->retarget($fragment->diff(), $fragment->target(), $mirror);
 
-        if ($this->applier->isApplied($mirrorDiff)) {
+        $above = $this->above($index, $fragment->target(), $mirror);
+        if ($this->applier->isAppliedBeneath($mirrorDiff, $mirror, $above)) {
             return;
         }
 
-        if ($this->applier->canApply($mirrorDiff)) {
+        $applicable = $this->applying
+            ? $this->applier->canApply($mirrorDiff)
+            : $this->applier->canApplyAbove($mirrorDiff, $mirror, $this->below($index, $fragment->target(), $mirror));
+
+        if ($applicable) {
             if (!$apply) {
                 $fragment->resolve(Fragment::APPLICABLE, $mirror . ' is not patched');
 

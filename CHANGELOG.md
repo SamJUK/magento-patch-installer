@@ -14,7 +14,12 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- A month that edits lines an earlier month added made the earlier one read as a
+  conflict, failing every Composer run after the first. Adobe's own files do this
+  (`vendor/bin/patch-status`). Links of a chain are now checked beneath the later
+  links and, when reporting, above the earlier ones.
 
 ## 0.2.0
 
