@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Sam James. Licensed under the Open Software License version 3.0.
+# SPDX-License-Identifier: OSL-3.0
+#
 # Acceptance tests for samjuk/magento-patch-installer.
 #
 # Runs the plugin against real Magento installations in the project's CI images
