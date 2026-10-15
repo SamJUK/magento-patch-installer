@@ -14,6 +14,10 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.3.0
+
 ### Fixed
 
 - **Security.** A store's own patch on top of a package's chain applied first,
