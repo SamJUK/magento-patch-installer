@@ -14,8 +14,8 @@ bin/release 1.2.0      # or name it yourself
 The script refuses rather than asks wherever it can: a dirty tree, a branch
 that is not `master`, a `master` that has diverged from origin, a tag that
 already exists, a changelog section that already exists, or a commit CI has
-not passed. It warns when the only acceptance evidence is the smoke job rather
-than the five-image matrix.
+not passed. It warns when the commit has no Acceptance run at all, which is the
+case for a commit that only touched prose.
 
 Then it recommends a version from the conventional commits, opens the draft
 notes in `$EDITOR`, prints exactly what will be published, and asks once.
@@ -47,9 +47,9 @@ Worth knowing for the run where something goes sideways.
    ```
 
 2. **Check CI is green on `master`**, including the five-image acceptance
-   matrix. Apply the `run-tests` label to the pull request, or run the
-   `Acceptance` workflow manually — the smoke job alone is not enough for a
-   release.
+   matrix. It runs on every pull request and every push to `master` that
+   touches code. If the last commit only touched prose, run the `Acceptance`
+   workflow manually.
 
 3. **Commit the changelog, then tag it.**
 

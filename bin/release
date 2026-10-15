@@ -75,7 +75,7 @@ else
     note "$CI_TOTAL run(s), all green"
 fi
 
-# The five-image matrix is label-gated, so green can mean the smoke leg alone.
+# A commit that only touched prose has no Acceptance run, so green can mean lint alone.
 if ! printf '%s\n' "$RUNS" | awk -F'\t' '{ print $3 }' | grep -q '^Acceptance$'; then
     note "no Acceptance run for this commit — the five-image matrix is what a release needs"
     read -r -p "    Continue anyway? [y/N] " reply
