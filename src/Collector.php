@@ -72,7 +72,9 @@ class Collector
 
         $declarations = $this->fromPackage($root, $this->rootDirectory());
 
-        $packages = $this->composer->getRepositoryManager()->getLocalRepository()->getPackages();
+        // Canonical: a package installed from a branch is also there as its
+        // alias, and read twice each chain link was checked with nothing on it.
+        $packages = $this->composer->getRepositoryManager()->getLocalRepository()->getCanonicalPackages();
 
         foreach ($packages as $package) {
             $this->installed[$package->getName()] = $package;

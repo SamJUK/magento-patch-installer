@@ -486,4 +486,38 @@ return [
     }
 },
 
+'r8-branch-alias' => static function (Sandbox $sandbox) use ($meta, $why): void {
+    // A package installed from a branch (dev-main, or a branch-alias) is in the
+    // local repository twice: itself and its alias. Read twice, each chain link
+    // was checked once with nothing stacked on it, and a chain read as a conflict.
+    $chain = $meta(['patches' => [
+        ['id' => 'M-1', 'source' => 'm1.patch'],
+        ['id' => 'M-2', 'source' => 'm2.patch', 'depends' => ['M-1']],
+    ]]);
+    foreach (['installed from a branch' => true, 'control: a tagged release' => false] as $how => $aliased) {
+        foreach (['the package alone' => false, 'with the store\'s own patch on top' => true] as $what => $own) {
+            Assert::case($how . ', ' . $what);
+            $root = ['trust' => ['acme/*']];
+            if ($own) {
+                $root['patches'] = [['id' => 'S-1', 'source' => 's1.patch', 'depends' => ['acme/meta:M-2']]];
+            }
+            $p = (new Project($sandbox, 'r8-alias-' . md5($how . $what)))
+                ->root($meta($root))
+                ->package('acme/meta', $chain)
+                ->write('vendor/acme/meta/m1.patch', "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n")
+                ->write('vendor/acme/meta/m2.patch', "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n")
+                ->write('s1.patch', "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n TWO\n+three\n")
+                ->write('a.txt', "one\n");
+            $p->aliased = $aliased ? ['acme/meta'] : [];
+            $patcher = $p->patcher();
+            $applied = $patcher->run(true);
+            Assert::same([], $patcher->errors(), 'no configuration error');
+            Assert::same(Renderer::OK, Renderer::exitCode($applied), 'applies: ' . $why($applied));
+            Assert::same($own ? "one\nTWO\nthree\n" : "one\nTWO\n", (string) file_get_contents($p->root . '/a.txt'), 'each patch once');
+            $status = $p->patcher()->run(false);
+            Assert::same(Renderer::OK, Renderer::exitCode($status), 'and verifies: ' . $why($status));
+        }
+    }
+},
+
 ];

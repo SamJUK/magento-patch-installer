@@ -46,6 +46,9 @@ final class Project
     /** @var string[] packages the root requires */
     public $rootRequires = [];
 
+    /** @var string[] packages installed from a branch, so the local repository holds an alias of each too */
+    public $aliased = [];
+
     /** @var array<string, string> package => its composer type */
     private $types = [];
 
@@ -151,6 +154,9 @@ final class Project
             }
             $package->setReplaces($replaced);
             $repository->addPackage($package);
+            if (in_array($name, $this->aliased, true)) {
+                $repository->addPackage(new \Composer\Package\AliasPackage($package, '9999999.9999999.9999999.9999999-dev', 'dev-main'));
+            }
             $installed[$name] = $this->root . '/vendor/' . $name;
         }
 
