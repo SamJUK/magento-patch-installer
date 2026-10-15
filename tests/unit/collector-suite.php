@@ -835,6 +835,28 @@ return [
         Assert::same([], $recorded($p), 'nothing is recorded as applied');
     }
 
+    Assert::case('a patch whose lines are already there is never written a second time');
+    // A patch built on, then left behind when what was on top of it went
+    // away: its own block is still in the file, the context after it is not,
+    // and its generic leading context matches further down. git apply put the
+    // block in again there, at an offset, and verify passed on two copies.
+    $twice = static function (string $name, string $contents) use ($project, $meta): Project {
+        return $project($name)
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->write('own.patch', "--- a/f.txt\n+++ b/f.txt\n@@ -2,3 +2,5 @@\n b\n c\n+location /media/customer_address/ {\n+}\n d\n")
+            ->write('f.txt', $contents);
+    };
+    $already = "1\nb\nc\nlocation /media/customer_address/ {\n}\nX\nb\nc\nd\n";
+    $p = $twice('twice', $already);
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'it is a conflict');
+    Assert::same($already, (string) file_get_contents($p->root . '/f.txt'), 'and the file is left alone');
+    Assert::contains((string) $results[0]['fragments'][0]->reason(), 'already in', 'saying why');
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($twice('twice-report', $already)->patcher()->run(false)), 'a report says so too');
+    $p = $twice('twice-control', "1\nz\nb\nc\nd\n");
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'control: a patch that only moved still applies at its offset');
+    Assert::same("1\nz\nb\nc\nlocation /media/customer_address/ {\n}\nd\n", (string) file_get_contents($p->root . '/f.txt'), 'control: once');
+
     Assert::case('a skipped patch comes off whole or not at all');
     // Taking a skipped patch off writes too, and the second file failing used
     // to leave the first one reverted: half a security patch, on every run.
@@ -2947,6 +2969,68 @@ return [
     }
 },
 
+'guard' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+    $own = static function (string $name, string $patch, string $file) use ($sandbox, $meta): Project {
+        return (new Project($sandbox, $name))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->write('own.patch', $patch)
+            ->write('f.php', $file);
+    };
+    $verdicts = static function (array $results): string {
+        $out = [];
+        foreach ($results as $r) {
+            foreach ($r['fragments'] as $f) {
+                $out[] = $f->target() . '=' . $f->verdict() . ' ' . (string) $f->reason();
+            }
+        }
+        return implode('; ', $out);
+    };
+
+    Assert::case('reorder hunk (moves a check before use), applied at an offset');
+    // The hunk adds the very line it removes, two lines lower. Built against a
+    // file with two fewer leading lines, so git applies it at offset 2.
+    $patch = "--- a/f.php\n+++ b/f.php\n@@ -3,5 +3,5 @@\n function run(\$request) {\n+    \$this->check(\$request);\n     \$result = \$this->process(\$request);\n-    \$this->check(\$request);\n     return \$result;\n }\n";
+    $atOffset = "<?php\n// header\n// more\n\nfunction run(\$request) {\n    \$result = \$this->process(\$request);\n    \$this->check(\$request);\n    return \$result;\n}\n";
+    $noOffset = "<?php\n\nfunction run(\$request) {\n    \$result = \$this->process(\$request);\n    \$this->check(\$request);\n    return \$result;\n}\n";
+
+    $p = $own('reorder-control', $patch, $noOffset);
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'control: at offset 0 it applies ' . $verdicts($r));
+
+    $p = $own('reorder-offset', $patch, $atOffset);
+    $r = $p->patcher()->run(false);
+    Assert::same(Renderer::UNAPPLIED, Renderer::exitCode($r), 'status: a legitimate patch at an offset is applicable ' . $verdicts($r));
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'apply: it applies ' . $verdicts($r));
+
+    Assert::case('a hunk adding a line that exists elsewhere in the file, at an offset');
+    $file = "<?php\n// one\n// two\nclass A {\n    public function a(\$x) {\n        if (\$x) {\n            return false;\n        }\n        return true;\n    }\n    public function b(\$y) {\n        if (!\$y) {\n            return true;\n        }\n        return true;\n    }\n}\n";
+    // Built against the same file without the two comment lines.
+    $patch = "--- a/f.php\n+++ b/f.php\n@@ -9,5 +9,8 @@\n     public function b(\$y) {\n         if (!\$y) {\n             return true;\n         }\n+        if (\$y === 'admin') {\n+            return false;\n+        }\n         return true;\n";
+    // control: the same patch against the exact file it was built on
+    $base = str_replace("// one\n// two\n", '', $file);
+    $p = $own('elsewhere-control', $patch, $base);
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'control: no offset, applies ' . $verdicts($r));
+
+    $p = $own('elsewhere-offset', $patch, $file);
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'offset: applies ' . $verdicts($r));
+
+    Assert::case('a one-line hunk whose line is a substring of another line, at an offset');
+    $file = "<?php\n// one\nfunction a(\$id) {\n    \$id = (int) \$id;\n    return \$this->load(\$id);\n}\n\nfunction b(\$id) {\n    return \$this->delete(\$id);\n}\n";
+    $patch = "--- a/f.php\n+++ b/f.php\n@@ -6,4 +6,5 @@\n \n function b(\$id) {\n+    \$id = (int) \$id;\n     return \$this->delete(\$id);\n }\n";
+    $p = $own('substr-control', $patch, str_replace("// one\n", '', $file));
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'control: no offset, applies ' . $verdicts($r));
+    $p = $own('substr-offset', $patch, $file);
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'offset: applies ' . $verdicts($r));
+},
+
 'other-copy-missing' => static function (Sandbox $sandbox): void {
     $meta = static function (array $extra): array {
         return ['magento-patches' => $extra];
@@ -2964,6 +3048,36 @@ return [
         Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'), $how . ': package copy patched');
         Assert::contains(implode("\n", array_column($patcher->advisories(), 'message')), 'composer reinstall magento/magento2-base', $how . ': warns that the served copy is missing');
     }
+},
+
+'guard-chain' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+    Assert::case('a month adding "deny all;" to a location block, after an earlier month shifted the file');
+    $base = "server {\n    location /media/import/ {\n        deny all;\n    }\n    location /media/custom_options/ {\n    }\n    location /media/ {\n        try_files \$uri \$uri/ /get.php;\n    }\n}\n";
+    // M-1 adds a block near the top, M-2 (built against the release) adds deny all to custom_options.
+    $m1 = "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -1,2 +1,5 @@\n server {\n+    location /media/customer_address/ {\n+        deny all;\n+    }\n     location /media/import/ {\n";
+    $m2 = "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -4,4 +4,5 @@\n     }\n     location /media/custom_options/ {\n+        deny all;\n     }\n     location /media/ {\n";
+    $store = static function (string $name, bool $withM1) use ($sandbox, $meta, $base, $m1, $m2): Project {
+        $patches = $withM1
+            ? [['id' => 'M-1', 'source' => 'm1.patch'], ['id' => 'M-2', 'source' => 'm2.patch']]
+            : [['id' => 'M-2', 'source' => 'm2.patch']];
+        return (new Project($sandbox, $name))
+            ->root($meta(['lines' => ['L' => ['base' => ['project/root' => '*'], 'cumulative' => true, 'patches' => $patches]]]))
+            ->write('m1.patch', $m1)->write('m2.patch', $m2)->write('nginx.conf.sample', $base);
+    };
+    $why = static function (array $results): string {
+        $o = [];
+        foreach ($results as $r) { foreach ($r['fragments'] as $f) { $o[] = $r['id'] . ':' . $f->verdict() . ' ' . $f->reason(); } }
+        return implode(' | ', $o);
+    };
+    $p = $store('nginx-control', false);
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'control: M-2 alone applies ' . $why($r));
+    $p = $store('nginx-chain', true);
+    $r = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($r), 'M-1 then M-2 apply ' . $why($r));
 },
 
 'require-against' => static function (Sandbox $sandbox): void {

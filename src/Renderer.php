@@ -392,8 +392,10 @@ class Renderer
     private static function wrongWith(int $code, array $counts, array $errors): string
     {
         if ($code === self::CONFIG_ERROR) {
+            // Not "dropped": a skip the config error makes invalid is ignored,
+            // and its patch applied, so saying nothing was applied is false.
             return sprintf(
-                '%d configuration problem%s — patches were dropped, not applied',
+                '%d configuration problem%s, listed above — the patches are not as declared',
                 count($errors),
                 count($errors) === 1 ? '' : 's'
             );

@@ -992,7 +992,7 @@ return [
 
     $broken = Renderer::banner([], ['fake/pkg is not trusted']);
     Assert::contains($broken, '!!! ISSUE', 'a configuration error is an issue');
-    Assert::contains($broken, 'patches were dropped', 'and never reads as nothing to do');
+    Assert::contains($broken, 'configuration problem, listed above', 'and never reads as nothing to do');
 
     Assert::case('a store past end of life still says OK about its patches');
     // The banner reports the patching, not the store. An unsupported store

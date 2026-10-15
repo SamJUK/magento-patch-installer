@@ -132,6 +132,24 @@ return [
     }
 },
 
+'guard-fp2' => static function (Sandbox $sandbox) use ($meta): void {
+    $why = static function (array $r): string { $o=[]; foreach ($r as $x) { foreach ($x['fragments'] as $f) { $o[] = $f->verdict() . ' ' . $f->reason(); } } return implode(' | ', $o); };
+    // a() already escapes, then prints; b() does not escape, and echoes. The patch fixes b().
+    $base = "<?php\nfunction a(\$items) {\n    foreach (\$items as \$item) {\n        \$value = \$item->getData('value');\n        \$label = \$item->getData('label');\n        \$label = \$this->escaper->escapeHtml(\$label);\n        print \$label;\n    }\n}\nfunction b(\$items) {\n    foreach (\$items as \$item) {\n        \$value = \$item->getData('value');\n        \$label = \$item->getData('label');\n        echo \$label;\n    }\n}\n";
+    $patch = "--- a/f.php\n+++ b/f.php\n@@ -11,5 +11,6 @@ function b(\$items) {\n     foreach (\$items as \$item) {\n         \$value = \$item->getData('value');\n         \$label = \$item->getData('label');\n+        \$label = \$this->escaper->escapeHtml(\$label);\n         echo \$label;\n     }\n";
+    foreach (['control: no offset' => $base, 'an earlier month shifted the file by two lines' => str_replace("<?php\n", "<?php\n// one\n// two\n", $base)] as $how => $file) {
+        Assert::case($how);
+        $p = (new Project($sandbox, 'gfp2-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->write('own.patch', $patch)->write('f.php', $file);
+        $r = $p->patcher()->run(false);
+        Assert::same(Renderer::UNAPPLIED, Renderer::exitCode($r), 'status: applicable ' . $why($r));
+        $r = $p->patcher()->run(true);
+        Assert::same(Renderer::OK, Renderer::exitCode($r), 'apply: OK ' . $why($r));
+        Assert::same(2, substr_count((string) file_get_contents($p->root . '/f.php'), 'escapeHtml'), 'b is fixed');
+    }
+},
+
 'transitive-against' => static function (Sandbox $sandbox) use ($meta, $patchFor, $summary): void {
     // base requires lib, lib requires z. z's patch depends on base's (against the require). lib's patch is innocent.
     $orders = ['base,lib,z' => ['base', 'lib', 'z'], 'lib,base,z' => ['lib', 'base', 'z'], 'z,lib,base' => ['z', 'lib', 'base'], 'lib,z,base' => ['lib', 'z', 'base'], 'base,z,lib' => ['base', 'z', 'lib'], 'z,base,lib' => ['z', 'base', 'lib']];
@@ -157,6 +175,21 @@ return [
             Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/a.txt'), 'SEC-1 applied: ' . $s);
             Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/b.txt'), 'LIB-1 applied: ' . $s);
         }
+    }
+},
+
+
+'guard-bytes' => static function (Sandbox $sandbox): void {
+    Assert::case('the duplicate guard reads lines whatever bytes they hold');
+    // preg_split on \R without /u also splits on 0x85, which UTF-8 uses in
+    // Cyrillic and CJK characters, and a duplicate holding one was missed.
+    $kha = "\xD1\x85";
+    $patch = "--- a/f.txt\n+++ b/f.txt\n@@ -2,3 +2,4 @@\n b\n c\n+label = '{$kha}orosho';\n d\n";
+    foreach (['non-ASCII' => $kha, 'control: ASCII' => ''] as $how => $char) {
+        $dir = $sandbox->mkdir('guard-bytes-' . md5($how));
+        file_put_contents($dir . '/f.txt', "1\nb\nc\nlabel = '{$char}orosho';\nX\nb\nc\nd\n");
+        $applier = new \SamJUK\MagentoPatchInstaller\Applier(new \Composer\Util\ProcessExecutor(), $dir);
+        Assert::false($applier->canApply(str_replace($kha, $char, $patch)), $how . ': a second copy is refused');
     }
 },
 
@@ -250,6 +283,33 @@ return [
     }
 },
 
+'guard-locale' => static function (Sandbox $sandbox): void {
+    Assert::case('the duplicate guard works whatever the locale');
+    // git translates what -v prints, and under a German locale the guard
+    // never saw "Hunk #1 succeeded at" and let a second copy through.
+    foreach (['control: C' => 'C', 'de_DE.UTF-8' => 'de_DE.UTF-8'] as $how => $locale) {
+        $saved = [getenv('LC_ALL'), getenv('LANG'), getenv('LANGUAGE')];
+        putenv('LC_ALL=' . $locale);
+        putenv('LANG=' . $locale);
+        putenv('LANGUAGE');
+
+        try {
+            $dir = $sandbox->mkdir('guard-locale-' . md5($how));
+            file_put_contents($dir . '/f.txt', "1\nb\nc\nlabel = 'x';\nX\nb\nc\nd\n");
+            $applier = new \SamJUK\MagentoPatchInstaller\Applier(new \Composer\Util\ProcessExecutor(), $dir);
+            Assert::false(
+                $applier->canApply("--- a/f.txt\n+++ b/f.txt\n@@ -2,3 +2,4 @@\n b\n c\n+label = 'x';\n d\n"),
+                $how . ': a second copy is refused'
+            );
+        } finally {
+            foreach (['LC_ALL', 'LANG', 'LANGUAGE'] as $i => $name) {
+                putenv($saved[$i] === false ? $name : $name . '=' . $saved[$i]);
+            }
+        }
+    }
+},
+
+// Packages and their patches as [requires, [[id, depends], ...]], each patch adding "two" to <id>.txt.
 'r6-refused-enters-its-package' => static function (Sandbox $sandbox) use ($meta, $patchFor, $why): void {
     // top requires lib, addon requires top, y requires z. T-1 depends on addon's
     // A-1, against the require, so T-1 is refused. Z-1 is built on T-1, and the

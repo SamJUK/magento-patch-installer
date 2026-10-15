@@ -29,6 +29,9 @@ here into the GitHub release body. See `docs/releasing.md`.
   was there. The mode is now set.
 - **Security.** A root file missing from the project root blocked its patch and
   everything built on it. The package copy is patched instead, with a warning.
+- **Security.** A patch could be written a second time further down a file
+  while `verify` passed. An apply at an offset is refused when its lines are
+  already there.
 - **Security.** `composer -d <dir> dump-autoload` skipped healing. It now heals
   however the command is run.
 - **Security.** Any package's `extra.map` counted as a root file's deploy

@@ -43,7 +43,29 @@ class Applier
      */
     public function canApply(string $diff): bool
     {
-        return $this->run($diff, ['--check']) === 0;
+        $code = $this->run($diff, ['--check', '-v']);
+        $verbose = $this->lastError;
+        $this->lastError = self::quiet($verbose);
+
+        if ($code !== 0) {
+            return false;
+        }
+
+        $moved = self::offsets($verbose);
+
+        if ($moved === []) {
+            return true;
+        }
+
+        $why = $this->appliedAgain($diff, $moved);
+
+        if ($why !== null) {
+            $this->lastError = $why;
+
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -53,6 +75,146 @@ class Applier
     public function isApplied(string $diff): bool
     {
         return $this->run($diff, ['-R', '--check']) === 0;
+    }
+
+    /**
+     * Why applying $diff would put lines in a second time, or null.
+     *
+     * A hunk whose leading context is boilerplate can match somewhere else
+     * in the file, and git apply takes it there at an offset. That is right
+     * for a file that has only moved. It is wrong when the hunk's own lines
+     * are already in the file between where it was made for and where git
+     * would put it: a patch left behind once something stacked on it went
+     * away no longer reverse-checks, and git apply then wrote its block again
+     * further down while verify passed on two copies.
+     *
+     * @param array<int, array{line: int, offset: int}> $moved hunks the forward check placed at an offset
+     */
+    private function appliedAgain(string $diff, array $moved): ?string
+    {
+        $fragments = (new Splitter())->split($diff);
+        $contents = $fragments === [] ? false : @file_get_contents($this->projectRoot . '/' . $fragments[0]->target());
+
+        if ($contents === false) {
+            return null;
+        }
+
+        // Each hunk's start, and its lines as they read once applied: context
+        // and additions, with what it removes left out.
+        $starts = $after = [];
+        $hunk = 0;
+
+        foreach (explode("\n", $diff) as $line) {
+            $line = rtrim($line, "\r");
+
+            if (preg_match('/^@@ -(\d+)/', $line, $header) === 1) {
+                $hunk++;
+                $starts[$hunk] = (int) $header[1];
+            } elseif ($hunk > 0 && ($line === '' || $line[0] === ' ' || $line[0] === '+')) {
+                $after[$hunk][] = [$line !== '' && $line[0] === '+', (string) substr($line, 1)];
+            }
+        }
+
+        $lines = explode("\n", str_replace("\r\n", "\n", $contents));
+
+        foreach ($moved as $number => $where) {
+            $run = $this->firstAddition($after[$number] ?? []);
+
+            if ($run === null) {
+                continue;
+            }
+
+            // Its own lines, beside the context they belong after, already in
+            // the file as whole lines, between where it was made for and where
+            // git would put it: a second copy. The same lines anywhere else (a
+            // `deny all;`, the loop beside it) are another place.
+            $start = $starts[$number] ?? $where['line'];
+            $from = min($start, $where['line']) - 3;
+            $to = max($start, $where['line']) + 3;
+
+            for ($i = max(0, $from - 1), $last = min(count($lines) - count($run), $to); $i <= $last; $i++) {
+                if (array_slice($lines, $i, count($run)) === $run) {
+                    return sprintf(
+                        'hunk %d would go in a second time, %d lines from where it belongs: the lines it adds are already in %s',
+                        $number,
+                        abs($where['offset']),
+                        $fragments[0]->target()
+                    );
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * A hunk's first run of added lines with up to three context lines before
+     * it, or after it where nothing comes before: null when there is no such
+     * run, or no context to place it, or nothing in it but blanks and braces.
+     *
+     * @param array<int, array{0: bool, 1: string}> $after a hunk's lines once applied, each flagged when added
+     *
+     * @return string[]|null
+     */
+    private function firstAddition(array $after): ?array
+    {
+        $start = null;
+
+        foreach ($after as $position => [$added]) {
+            if ($added) {
+                $start = $position;
+                break;
+            }
+        }
+
+        if ($start === null) {
+            return null;
+        }
+
+        $end = $start;
+        while (isset($after[$end + 1]) && $after[$end + 1][0]) {
+            $end++;
+        }
+
+        $added = array_column(array_slice($after, $start, $end - $start + 1), 1);
+        $before = array_column(array_slice($after, max(0, $start - 3), $start - max(0, $start - 3)), 1);
+        $context = $before !== [] ? $before : array_column(array_slice($after, $end + 1, 3), 1);
+
+        $telling = array_filter($added, static function (string $line): bool {
+            return strlen(trim($line, " \t{}();")) > 0;
+        });
+
+        if ($context === [] || $telling === []) {
+            return null;
+        }
+
+        return $before !== [] ? array_merge($before, $added) : array_merge($added, $context);
+    }
+
+    /**
+     * The hunks `git apply -v` placed somewhere other than where they say.
+     *
+     * @return array<int, array{line: int, offset: int}> hunk number => where it went, and how far that is
+     */
+    private static function offsets(string $verbose): array
+    {
+        preg_match_all('/^Hunk #(\d+) succeeded at (\d+) \(offset (-?\d+) lines?\)\./m', $verbose, $matches, PREG_SET_ORDER);
+        $moved = [];
+
+        foreach ($matches as [, $hunk, $line, $offset]) {
+            $moved[(int) $hunk] = ['line' => (int) $line, 'offset' => (int) $offset];
+        }
+
+        return $moved;
+    }
+
+    /**
+     * What `git apply -v` said, without the lines -v adds: those are for
+     * offsets(), not for the reason a conflict gives.
+     */
+    private static function quiet(string $verbose): string
+    {
+        return trim((string) preg_replace('/^(Checking patch .*|Hunk #\d+ succeeded at .*|Applied patch .*)\R?/m', '', $verbose));
     }
 
     /**
@@ -179,17 +341,41 @@ class Applier
             ProcessExecutor::escape($file)
         );
 
+        // offsets() reads what -v prints, and git translates it: under a German
+        // locale "Hunk #1 succeeded at" never appears and the duplicate guard
+        // switched itself off. Composer only sets this for its own VCS calls.
+        $language = getenv('LANGUAGE');
+        self::setEnv('LANGUAGE', 'C');
+
         try {
             $code = $this->process->execute($command, $output, $this->projectRoot);
             $this->lastError = trim($this->process->getErrorOutput());
 
             return $code;
         } finally {
+            self::setEnv('LANGUAGE', $language === false ? null : $language);
             @unlink($file);
         }
     }
 
-    private function write(string $diff): string
+    /**
+     * Where the process Composer starts reads its environment from: putenv()
+     * alone is not enough, as it keeps only what $_SERVER also has.
+     */
+    private static function setEnv(string $name, ?string $value): void
+    {
+        if ($value === null) {
+            putenv($name);
+            unset($_SERVER[$name], $_ENV[$name]);
+
+            return;
+        }
+
+        putenv($name . '=' . $value);
+        $_SERVER[$name] = $_ENV[$name] = $value;
+    }
+
+        private function write(string $diff): string
     {
         if ($this->tempDir === null) {
             $this->tempDir = $this->makeTempDir();
