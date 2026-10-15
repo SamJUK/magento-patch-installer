@@ -2,7 +2,7 @@
     "name": "samjuk/magento-patch-installer",
     "description": "Applies Magento 2 / Adobe Commerce security patches, verifies they stay applied, and fails loudly when they do not",
     "type": "composer-plugin",
-    "license": "MIT",
+    "license": "OSL-3.0",
     "keywords": [
         "magento",
         "magento2",

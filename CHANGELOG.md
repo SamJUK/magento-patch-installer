@@ -14,7 +14,9 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ## Unreleased
 
-Nothing yet.
+### Changed
+
+- Licensed under OSL-3.0. Releases up to 0.2.1 stay under MIT.
 
 ## 0.2.1 — 2026-10-09
 
