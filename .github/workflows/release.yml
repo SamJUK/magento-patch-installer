@@ -68,3 +68,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      # Packagist's webhook fails quietly when its GitHub grant lapses, and its
+      # badge stays green. Ten minutes is far longer than a working hook takes.
+      - name: Packagist has the release
+        run: |
+          for _ in $(seq 20); do
+            curl -sf "https://repo.packagist.org/p2/$(jq -r .name composer.json).json?$(date +%s)" \
+              | jq -e --arg v "${GITHUB_REF_NAME}" '.packages[][] | select(.version == $v)' >/dev/null && exit 0
+            sleep 30
+          done
+          echo "::error::${GITHUB_REF_NAME} is not on Packagist after ten minutes. Check the GitHub connection on the Packagist profile."
+          exit 1
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
