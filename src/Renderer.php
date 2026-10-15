@@ -771,14 +771,15 @@ class Renderer
      *
      * @param array<int, array<string, mixed>> $results
      * @param string[] $errors
+     * @param int|null $exitCode what the process exits with, where the command decides it
      */
-    public static function json(array $results, array $errors = []): string
+    public static function json(array $results, array $errors = [], ?int $exitCode = null): string
     {
         $out = [
             // The same code the process exits with. A body saying 0 while the
             // process says 3 is worse than no field at all — the consumer of
             // this mode is automation, and automation reads the body.
-            'exit_code' => $errors === [] ? self::exitCode($results) : self::CONFIG_ERROR,
+            'exit_code' => $exitCode ?? ($errors === [] ? self::exitCode($results) : self::CONFIG_ERROR),
             'errors' => $errors,
             'patches' => [],
         ];

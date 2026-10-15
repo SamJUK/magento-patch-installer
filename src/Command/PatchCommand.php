@@ -90,9 +90,11 @@ class PatchCommand extends BaseCommand
         }
 
         if ($input->getOption('json')) {
-            $output->writeln(Renderer::json($results, $errors));
+            // status exits 0 whatever it finds, and its body has to say so too.
+            $code = $this->resultCode($errors, $results);
+            $output->writeln(Renderer::json($results, $errors, $code));
 
-            return $this->resultCode($errors, $results);
+            return $code;
         }
 
         $advisories = $patcher->advisories();

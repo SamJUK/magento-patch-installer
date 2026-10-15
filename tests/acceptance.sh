@@ -689,6 +689,19 @@ s_json_is_json() {
 
     run "cd /var/www/html && cp /tmp/s22.json composer.json" >/dev/null
     check "clean again once restored" "0" "$(verify_code)"
+
+    # status reports and exits 0 whatever it finds. Its body said the verdict
+    # instead, so the one field automation reads disagreed with the process.
+    local body='php -r "echo json_decode(stream_get_contents(STDIN), true)[\"exit_code\"];"'
+    run "cd /var/www/html && composer reinstall magento/framework --no-plugins --no-interaction" >/dev/null
+    check "status --json exits 0 on a store missing a patch" "0" \
+        "$(run "cd /var/www/html && composer magento-patches:status --json --no-interaction >/dev/null 2>&1; echo \$?")"
+    check "and its body says the same" "0" \
+        "$(run "cd /var/www/html && composer magento-patches:status --json --no-interaction 2>/dev/null | $body")"
+    check "while verify --json says 1 in both" "1:1" \
+        "$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction >/dev/null 2>&1; echo \$?"):$(run "cd /var/www/html && composer magento-patches:verify --json --no-interaction 2>/dev/null | $body")"
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "and an apply puts it right" "0" "$(verify_code)"
 }
 
 s_catalogue() {

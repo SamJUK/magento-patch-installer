@@ -14,6 +14,10 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ## Unreleased
 
+### Fixed
+
+- `status --json` reports the exit code the command exits with.
+
 ### Changed
 
 - Licensed under OSL-3.0. Releases up to 0.2.1 stay under MIT.
