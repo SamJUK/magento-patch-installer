@@ -219,7 +219,7 @@ Both produce a green build over an unpatched store, so a patcher that can be swi
 - run: composer magento-patches:verify --no-interaction
 ```
 
-The same step catches a patched root file being reverted, or going missing, between deploys. Anything that re-deploys `magento2-base` without going through Composer — an rsync, a `cp -r` in a Dockerfile, `bin/magento setup:upgrade` — is invisible to this plugin because there is no Composer event to hook. `magento-patches:verify` reads the working tree and will tell you.
+The same step catches a patched root file being reverted between deploys, and warns when one has gone missing: the patch then goes to `magento2-base`'s copy, which the next deploy serves from, and the warning says which reinstall puts the served file back. Anything that re-deploys `magento2-base` without going through Composer — an rsync, a `cp -r` in a Dockerfile, `bin/magento setup:upgrade` — is invisible to this plugin because there is no Composer event to hook. `magento-patches:verify` reads the working tree and will tell you.
 
 ## Declaring Patches
 
@@ -332,7 +332,7 @@ A `depends` that nothing declares, or that several sources could still answer, i
 
 **Your patch and a package's on the same file need an order.** If the store's own patch changes a file that a trusted package's patch also changes, and neither depends on the other, the store's patch is refused with a configuration error that names the package's patch to add to `depends`. Name every one it overlaps. In the example above that is the month before *and* the StyleSmuggler hotfix, which shares two files with October and is not part of the monthly chain. The package's patch is never the one refused: nothing a store or a sibling declares can switch off a trusted package's security patch. The check only applies where `depends` could fix it; a store's top-level patch against a package's line gets a warning saying where to declare it instead.
 
-**A package goes on top of the packages it requires.** Requiring a package is how an add-on says it builds on it, so its patches apply after that package's, and one that changes the same file is checked as built on it, exactly as if it had named it in `depends`. A private package carrying the licensed month above needs only to require this one. The store's own `composer.json` gets no such rule: it requires everything, so its patches still need `depends`.
+**A package goes on top of the packages it requires.** Requiring a package is how an add-on says it builds on it, so its patches apply after that package's, and one that changes the same file is checked as built on it. A private package carrying the licensed month above needs only to require this one. One difference from `depends`: a store skipping that package's patch does not skip yours with it, so name it in `depends` if yours cannot stand without it. The store's own `composer.json` gets no such rule: it requires everything, so its patches still need `depends`.
 
 Between two packages where neither requires the other, the same overlap is only a warning. Neither vendor knows about the other and the store cannot edit their declarations, so refusing would make them impossible to install together; a real clash still fails the run as a conflict. Within one package two independent fixes to a file are normal, and the author owns their order.
 
@@ -458,7 +458,7 @@ An exit code is not taken as evidence that anything was written: after applying,
 
 It also runs on `composer dump-autoload`, which fires neither of those events. Writing during what looks like a metadata command is deliberate: `vaimo/composer-patches` hooks `pre-autoload-dump`, so a bare `composer dump-autoload` gives it a full reset-and-repatch cycle in a command this plugin would otherwise never be called for. Measured on a real store, that took a green tree to `magento-patches:verify` exiting `1` with no opportunity to heal. With no other patcher installed the run is a no-op.
 
-**Root-mapped files are patched in both places.** For the files `magento2-base` deploys to the project root, the served copy and the package copy are both patched — the first because it is what runs, the second because any future deploy copies it back over the first. The mapping is read from the package's own `extra.map` at runtime, so patch files are never edited to name two locations.
+**Root-mapped files are patched in both places.** For the files `magento2-base` deploys to the project root, the served copy and the package copy are both patched — the first because it is what runs, the second because any future deploy copies it back over the first. The mapping is read at runtime the way `magento-composer-installer` deploys it, so patch files are never edited to name two locations: only `magento2-*` package types count, and the root's `magento-map-overwrite`, `path-mapping-translations` and `magento-deploy-ignore` apply. Where two packages deploy the same root file, which copy is served depends on their deploy order, so a patch changing it is refused as a configuration error until one of them is removed or ignored.
 
 ## State File, Dependabot & Renovate
 

@@ -102,6 +102,36 @@ return [
     }
 },
 
+'mode-mirror' => static function (Sandbox $sandbox) use ($meta, $summary): void {
+    $modeOnly = "diff --git a/bin/magento b/bin/magento\nold mode 100644\nnew mode 100755\n";
+    $modeAndContent = $modeOnly . "--- a/bin/magento\n+++ b/bin/magento\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n";
+    $perm = static function (Project $p, string $path): string { clearstatcache(); return sprintf('%o', fileperms($p->root . '/' . $path) & 0777); };
+    $cases = [
+        // name => [root contents, root mode, package contents, package mode]
+        'control: content in place both, in step, no mode' => ["1\n2a\n3\n", 0644, "1\n2a\n3\n", 0644],
+        'content in place both, diverged, no mode on either' => ["1\n2a\n3\n", 0644, "1\n2a\n3\n# own\n", 0644],
+        'root fully applied, diverged package copy lacks mode' => ["1\n2a\n3\n", 0755, "1\n2a\n3\n# own\n", 0644],
+        'control: neither applied, diverged' => ["1\n2\n3\n", 0644, "1\n2\n3\n# own\n", 0644],
+    ];
+    foreach ($cases as $how => [$rc, $rm, $pc, $pm]) {
+        Assert::case($how);
+        $p = (new Project($sandbox, 'mm-' . md5($how)))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/magento2-base', ['map' => [['bin/magento', 'bin/magento']]], [], 'magento2-component')
+            ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]))
+            ->write('vendor/acme/patches/p.patch', $modeAndContent)
+            ->write('vendor/magento/magento2-base/bin/magento', $pc)
+            ->write('bin/magento', $rc);
+        chmod($p->root . '/vendor/magento/magento2-base/bin/magento', $pm);
+        chmod($p->root . '/bin/magento', $rm);
+        $s = $p->patcher()->run(false);
+        $statusCode = Renderer::exitCode($s);
+        $r = $p->patcher()->run(true);
+        Assert::same(Renderer::OK, Renderer::exitCode($r), $how . ': apply OK (status said ' . $statusCode . ' ' . $summary($s) . ') ' . $summary($r) . ' ' . json_encode(array_map(function($x){return array_map(function($f){return $f->reason();}, $x['fragments']);}, $r)));
+        Assert::same(['755', '755'], [$perm($p, 'bin/magento'), $perm($p, 'vendor/magento/magento2-base/bin/magento')], $how . ': both executable');
+    }
+},
+
 'transitive-against' => static function (Sandbox $sandbox) use ($meta, $patchFor, $summary): void {
     // base requires lib, lib requires z. z's patch depends on base's (against the require). lib's patch is innocent.
     $orders = ['base,lib,z' => ['base', 'lib', 'z'], 'lib,base,z' => ['lib', 'base', 'z'], 'z,lib,base' => ['z', 'lib', 'base'], 'lib,z,base' => ['lib', 'z', 'base'], 'base,z,lib' => ['base', 'z', 'lib'], 'z,base,lib' => ['z', 'base', 'lib']];
@@ -353,6 +383,46 @@ return [
         }
         Assert::same($closed ? ['L-1'] : [], $cyclic, 'only L-1, the depends against the require, is refused');
         Assert::true(microtime(true) - $started < 5, 'and settled in well under 5 seconds');
+    }
+},
+
+'r6-mode-link-status' => static function (Sandbox $sandbox) use ($meta, $why): void {
+    // bin/run links out of the project, and M-1, a content and mode change, is
+    // found applied beneath M-2. status said applicable where apply refused.
+    foreach (['the file links out' => true, 'control: a plain file' => false] as $how => $escapes) {
+        Assert::case($how);
+        $p = (new Project($sandbox, 'r6-cs-' . md5($how)))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('acme/patches', $meta(['patches' => [
+                ['id' => 'M-1', 'source' => 'm1.patch'],
+                ['id' => 'M-2', 'source' => 'm2.patch', 'depends' => ['M-1']],
+            ]]))
+            ->write('vendor/acme/patches/m1.patch', "diff --git a/bin/run b/bin/run\nold mode 100644\nnew mode 100755\n--- a/bin/run\n+++ b/bin/run\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n")
+            ->write('vendor/acme/patches/m2.patch', "--- a/bin/run\n+++ b/bin/run\n@@ -1,3 +1,3 @@\n 1\n-2a\n+2b\n 3\n");
+        $outside = $sandbox->mkdir('r6-outside-' . md5($how));
+        $target = $escapes ? $outside . '/run' : $p->root . '/bin/run';
+        if (!is_dir(dirname($target))) {
+            mkdir(dirname($target), 0777, true);
+        }
+        file_put_contents($target, "1\n2b\n3\n");
+        chmod($target, 0644);
+        if ($escapes) {
+            mkdir($p->root . '/bin');
+            symlink($outside . '/run', $p->root . '/bin/run');
+        }
+        $verdict = static function (array $results): string {
+            foreach ($results as $r) {
+                if ($r['id'] === 'M-1') {
+                    return $r['fragments'][0]->verdict();
+                }
+            }
+            return 'missing';
+        };
+        $status = $p->patcher()->run(false);
+        $apply = $p->patcher()->run(true);
+        clearstatcache();
+        Assert::same($escapes ? ['conflict', 'conflict'] : ['applicable', 'applied'], [$verdict($status), $verdict($apply)], 'status says what apply then does: ' . $why($status) . ' then ' . $why($apply));
+        Assert::same($escapes ? 0644 : 0755, fileperms($target) & 0777, 'mode set only inside the project');
     }
 },
 

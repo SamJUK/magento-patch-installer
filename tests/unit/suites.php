@@ -454,6 +454,123 @@ return [
         $trailing->mirrorFor('nginx.conf.sample'),
         'mapping still resolves'
     );
+
+    Assert::case('deployed: destinations as magento-composer-installer roots them');
+    $component = TargetResolver::DEPLOYED_TYPES['magento2-component'];
+    Assert::same(
+        [['lib/web/underscore.js', 'lib/web/underscore.js', false]],
+        TargetResolver::deployed([['lib/web/underscore.js', 'lib/web/underscore.js']], $component, [], []),
+        'a component deploys from the project root, and the ./ it is given is not part of the path'
+    );
+    Assert::same(
+        [['src', 'app/code/Acme/Thing', false]],
+        TargetResolver::deployed([['src', 'Acme/Thing']], TargetResolver::DEPLOYED_TYPES['magento2-module'], [], []),
+        'a module\'s map is rooted under app/code'
+    );
+    Assert::same(
+        [['x', 'pub/js/x.js', false], ['y', 'pub/js/y.js', false], ['z', 'other/z.js', false]],
+        TargetResolver::deployed(
+            [['x', 'js/x.js'], ['y', './js/y.js'], ['z', 'other/z.js']],
+            $component,
+            ['js/' => 'pub/js/'],
+            []
+        ),
+        'path-mapping-translations rewrite a prefix, with or without ./'
+    );
+    Assert::same(
+        [['x', 'pub/x.js', false]],
+        TargetResolver::deployed([['x', 'a/x.js']], $component, ['a/' => 'pub/', 'pub/' => 'never/'], []),
+        'and only the first that matches'
+    );
+    Assert::same(
+        [['lib/web/underscore.js', 'lib/web/underscore.js', true], ['lib/web/jquery.js', 'lib/web/jquery.js', false]],
+        TargetResolver::deployed(
+            [['lib/web/underscore.js', 'lib/web/underscore.js'], ['lib/web/jquery.js', 'lib/web/jquery.js']],
+            $component,
+            [],
+            ['/lib/web/underscore.js']
+        ),
+        'magento-deploy-ignore marks what it names'
+    );
+    Assert::same(
+        [['lib/web/mage', 'lib/web/mage', true]],
+        TargetResolver::deployed([['lib/web/mage', 'lib/web/mage']], $component, [], ['/lib/web/mage/x.js']),
+        'and, by the installer\'s own prefix test, a whole directory holding what it names'
+    );
+    Assert::same(
+        [['lib/web/mage', 'lib/web/mage', false]],
+        TargetResolver::deployed([['lib/web/mage', 'lib/web/mage']], $component, [], ['/lib', 7]),
+        'while an entry shorter than the destination ignores nothing'
+    );
+    Assert::same(
+        null,
+        (new TargetResolver($root, [[
+            'package' => 'evil/package',
+            'install' => 'vendor/evil/package',
+            'map' => TargetResolver::deployed([['x', '../../outside.txt']], $component, [], []),
+        ]]))->mirrorFor('../../outside.txt'),
+        'a traversal survives into the resolver, which drops it'
+    );
+
+    Assert::case('contests: one root path, two packages');
+    $sandbox->write('project/vendor/acme/theme/nginx.conf.sample', "server\n");
+    $sandbox->write('project/vendor/acme/theme/mage/own.js', "mine\n");
+    $sandbox->write('project/' . $install . '/lib/web/mage/shared.js', "base\n");
+    $sandbox->write('project/vendor/acme/theme/mage/shared.js', "theirs\n");
+    $base = [
+        'package' => 'magento/magento2-base',
+        'install' => $install,
+        'map' => [['nginx.conf.sample', 'nginx.conf.sample'], ['lib/web/mage', 'lib/web/mage']],
+    ];
+    $sandbox->mkdir('project/' . $install . '/lib/web/mage');
+
+    $twice = new TargetResolver($root, [$base, [
+        'package' => 'acme/theme',
+        'install' => 'vendor/acme/theme',
+        'map' => [['nginx.conf.sample', 'nginx.conf.sample']],
+    ]]);
+    Assert::same(null, $twice->mirrorFor('nginx.conf.sample'), 'the served copy has no single other copy');
+    Assert::same(null, $twice->mirrorFor($install . '/nginx.conf.sample'), 'from magento2-base\'s side either');
+    Assert::same(null, $twice->mirrorFor('vendor/acme/theme/nginx.conf.sample'), 'nor from the other package\'s');
+    Assert::same(
+        'nginx.conf.sample is deployed to the project root by both magento/magento2-base and acme/theme',
+        $twice->contested('nginx.conf.sample'),
+        'and says who claims it'
+    );
+    Assert::same(null, $twice->contested('lib/web/mage/shared.js'), 'an uncontested path is not');
+    Assert::same($install . '/lib/web/mage/shared.js', $twice->mirrorFor('lib/web/mage/shared.js'), 'and still resolves');
+
+    Assert::case('contests: a directory competes only for what its package ships');
+    $beside = new TargetResolver($root, [$base, [
+        'package' => 'acme/theme',
+        'install' => 'vendor/acme/theme',
+        'map' => [['mage/own.js', 'lib/web/mage/own.js'], ['mage/shared.js', 'lib/web/mage/shared.js']],
+    ]]);
+    Assert::same(null, $beside->contested('lib/web/mage/own.js'), 'a file magento2-base does not ship is not contested');
+    Assert::same('vendor/acme/theme/mage/own.js', $beside->mirrorFor('lib/web/mage/own.js'), 'and its own package is its other copy');
+    Assert::true($beside->contested('lib/web/mage/shared.js') !== null, 'a file both ship is contested');
+    Assert::same(null, $beside->mirrorFor($install . '/lib/web/mage/shared.js'), 'so magento2-base\'s copy has no single counterpart');
+    Assert::same(null, $beside->contested($install . '/lib/web/mage/other.js'), 'while the rest of the directory is untouched');
+
+    Assert::case('contests: a claim the root has the installer ignore');
+    $ignoredTheme = [
+        'package' => 'acme/theme',
+        'install' => 'vendor/acme/theme',
+        'map' => TargetResolver::deployed([['nginx.conf.sample', 'nginx.conf.sample']], $component, [], ['/nginx.conf.sample']),
+    ];
+    $settled = new TargetResolver($root, [$ignoredTheme, $base]);
+    Assert::same(null, $settled->contested('nginx.conf.sample'), 'does not compete');
+    Assert::same($install . '/nginx.conf.sample', $settled->mirrorFor('nginx.conf.sample'), 'and loses to the package that deploys there, whatever the order');
+    $kept = new TargetResolver($root, [[
+        'package' => 'magento/magento2-base',
+        'install' => $install,
+        'map' => TargetResolver::deployed([['nginx.conf.sample', 'nginx.conf.sample']], $component, [], ['/nginx.conf.sample']),
+    ]]);
+    Assert::same(
+        $install . '/nginx.conf.sample',
+        $kept->mirrorFor('nginx.conf.sample'),
+        'but alone it still names the other copy, so a store keeping its own file keeps both patched'
+    );
 },
 
 /* ------------------------------------------------------------------ *

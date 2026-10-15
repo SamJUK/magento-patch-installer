@@ -738,6 +738,501 @@ return [
     Assert::same(Fragment::NOT_APPLICABLE, $verdicts['two.txt'], 'and the absent one is not a failure');
     Assert::same(Renderer::OK, Renderer::exitCode($results), 'so the run stays clean');
 
+    // ------------------------------------------------- all or nothing, mirrors and writes
+
+    $nginxHunk = "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n";
+    $lockedHunk = "--- a/locked/two.txt\n+++ b/locked/two.txt\n@@ -1 +1,2 @@\n alpha\n+beta\n";
+    $mirrored = static function (string $name, string $source) use ($project, $meta): Project {
+        return $project($name)
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component')
+            ->package('acme/patches', $meta(['patches' => [['id' => 'W-1', 'source' => $source]]]));
+    };
+    $file = static function (Project $p, string $relative): array {
+        $path = $p->root . '/' . $relative;
+        clearstatcache();
+
+        return is_file($path) ? [(string) file_get_contents($path), fileperms($path) & 0777] : [null, null];
+    };
+    $recorded = static function (Project $p): array {
+        $state = json_decode((string) @file_get_contents($p->root . '/var/composer-patches/state.json'), true);
+
+        return array_keys($state['patches'] ?? []);
+    };
+    $reasons = static function (array $result): array {
+        $reasons = [];
+        foreach ($result['fragments'] as $fragment) {
+            $reasons[$fragment->target()] = (string) $fragment->reason();
+        }
+
+        return $reasons;
+    };
+
+    Assert::case('a mirror that will not take the patch is found before anything is written');
+    // The primary needed patching, so the pre-flight used to stop there and
+    // never looked at the mirror. The conflict turned up after one.txt and the
+    // root nginx.conf.sample were written, and the rollback only knew about one.
+    $p = $mirrored('mirror-preflight', 'w.patch')
+        ->write('vendor/acme/patches/w.patch', "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1,2 @@\n one\n+two\n" . $nginxHunk)
+        ->write('one.txt', "one\n")
+        ->write('nginx.conf.sample', "1\n2\n3\n")
+        ->write('vendor/magento/magento2-base/nginx.conf.sample', "customised\n");
+    chmod($p->root . '/vendor/magento/magento2-base/nginx.conf.sample', 0640);
+    chmod($p->root . '/nginx.conf.sample', 0604);
+
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+    Assert::same("one\n", $file($p, 'one.txt')[0], 'the first file is untouched');
+    Assert::same(["1\n2\n3\n", 0604], $file($p, 'nginx.conf.sample'), 'and so is the served copy');
+    Assert::same(["customised\n", 0640], $file($p, 'vendor/magento/magento2-base/nginx.conf.sample'), 'and the customised mirror');
+    Assert::false(
+        strpos($reasons($results[0])['one.txt'], 'rolled back') !== false,
+        'refused by the pre-flight, not written and undone'
+    );
+    Assert::same([], $recorded($p), 'and nothing is recorded as applied');
+
+    Assert::case('a write that fails after others landed puts every one of them back');
+    // The tree changing underneath the run, after a clean pre-flight: here a
+    // directory git apply can read but not write. Everything the patch wrote
+    // before it, primary and mirror, has to come back.
+    $p = $mirrored('rollback-mirror', 'w.patch')
+        ->write('vendor/acme/patches/w.patch', $nginxHunk . $lockedHunk)
+        ->write('nginx.conf.sample', "1\n2\n3\n")
+        ->write('vendor/magento/magento2-base/nginx.conf.sample', "1\n2\n3\n")
+        ->write('locked/two.txt', "alpha\n");
+    chmod($p->root . '/nginx.conf.sample', 0604);
+    chmod($p->root . '/vendor/magento/magento2-base/nginx.conf.sample', 0640);
+    chmod($p->root . '/locked', 0555);
+
+    if (!is_writable($p->root . '/locked')) {
+        $results = $p->patcher()->run(true);
+        chmod($p->root . '/locked', 0755);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+        Assert::same(["1\n2\n3\n", 0604], $file($p, 'nginx.conf.sample'), 'the served copy is put back, mode and all');
+        Assert::same(["1\n2\n3\n", 0640], $file($p, 'vendor/magento/magento2-base/nginx.conf.sample'), 'and so is its mirror');
+        Assert::same("alpha\n", $file($p, 'locked/two.txt')[0], 'and the file that refused is as it was');
+        Assert::contains($reasons($results[0])['nginx.conf.sample'], 'rolled back', 'and the report says so');
+        Assert::same([], $recorded($p), 'nothing is recorded as applied');
+    }
+
+    Assert::case('a mirror that cannot be written takes its primary back with it');
+    // The failing fragment wrote its primary before the mirror refused. Its
+    // verdict is the failure, which the rollback used to read as "never wrote".
+    $p = $mirrored('rollback-own-primary', 'w.patch')
+        ->write('vendor/acme/patches/w.patch', "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1,2 @@\n one\n+two\n" . $nginxHunk)
+        ->write('one.txt', "one\n")
+        ->write('nginx.conf.sample', "1\n2\n3\n")
+        ->write('vendor/magento/magento2-base/nginx.conf.sample', "1\n2\n3\n");
+    chmod($p->root . '/vendor/magento/magento2-base/nginx.conf.sample', 0444);
+    chmod($p->root . '/nginx.conf.sample', 0604);
+
+    if (!is_writable($p->root . '/vendor/magento/magento2-base/nginx.conf.sample')) {
+        $results = $p->patcher()->run(true);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+        Assert::same("one\n", $file($p, 'one.txt')[0], 'the other file is put back');
+        Assert::same(["1\n2\n3\n", 0604], $file($p, 'nginx.conf.sample'), 'and so is the failing file\'s own primary, mode and all');
+        Assert::same(["1\n2\n3\n", 0444], $file($p, 'vendor/magento/magento2-base/nginx.conf.sample'), 'the mirror never changed');
+        Assert::same([], $recorded($p), 'nothing is recorded as applied');
+    }
+
+    Assert::case('a skipped patch comes off whole or not at all');
+    // Taking a skipped patch off writes too, and the second file failing used
+    // to leave the first one reverted: half a security patch, on every run.
+    $skipping = static function (string $name, string $source) use ($project, $meta): Project {
+        return $project($name)
+            ->root($meta([
+                'trust' => ['acme/*'],
+                'sources' => ['acme/patches' => ['skip' => ['U-1' => 'breaks our checkout']]],
+            ]))
+            ->package('acme/patches', $meta(['patches' => [['id' => 'U-1', 'source' => $source]]]));
+    };
+    $p = $skipping('skip-whole', 'u.patch')
+        ->write('vendor/acme/patches/u.patch', "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n--- a/locked/b.txt\n+++ b/locked/b.txt\n@@ -1 +1,2 @@\n alpha\n+beta\n")
+        ->write('a.txt', "one\ntwo\n")
+        ->write('locked/b.txt', "alpha\nbeta\n");
+    chmod($p->root . '/locked', 0555);
+
+    if (!is_writable($p->root . '/locked')) {
+        $results = $p->patcher()->run(true);
+        chmod($p->root . '/locked', 0755);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+        Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/a.txt'), 'and the file that came off is put back');
+        Assert::same("alpha\nbeta\n", (string) file_get_contents($p->root . '/locked/b.txt'), 'beside the one that would not');
+    }
+
+    $p = $skipping('skip-whole-control', 'u.patch')
+        ->write('vendor/acme/patches/u.patch', "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1,2 @@\n alpha\n+beta\n")
+        ->write('a.txt', "one\ntwo\n")
+        ->write('b.txt', "alpha\nbeta\n");
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'control: a skipped patch that can come off does');
+    Assert::same(["one\n", "alpha\n"], [file_get_contents($p->root . '/a.txt'), file_get_contents($p->root . '/b.txt')], 'control: from every file');
+
+    Assert::case('a skipped patch on a file two packages ship is not taken off one copy');
+    $p = $skipping('skip-contested', 'u.patch')
+        ->package('magento/magento2-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component')
+        ->package('magento/magento2-ee-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component')
+        ->write('vendor/acme/patches/u.patch', "--- a/pub/errors/processor.php\n+++ b/pub/errors/processor.php\n@@ -1,2 +1,2 @@\n <?php\n-\$a = 1;\n+\$a = 2;\n")
+        ->write('pub/errors/processor.php', "<?php\n\$a = 2;\n")
+        ->write('vendor/magento/magento2-base/pub/errors/processor.php', "<?php\n\$a = 2;\n")
+        ->write('vendor/magento/magento2-ee-base/pub/errors/processor.php', "<?php\n\$a = 2;\n");
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+    Assert::same("<?php\n\$a = 2;\n", (string) file_get_contents($p->root . '/pub/errors/processor.php'), 'and no copy is changed');
+    Assert::contains((string) $results[0]['fragments'][0]->reason(), 'deployed to the project root by both', 'it says why');
+
+    Assert::case('a rollback removes what the patch created and restores what it deleted');
+    $p = $mirrored('rollback-create-delete', 'w.patch')
+        ->write(
+            'vendor/acme/patches/w.patch',
+            "diff --git a/new/dir/created.txt b/new/dir/created.txt\nnew file mode 100644\n"
+            . "--- /dev/null\n+++ b/new/dir/created.txt\n@@ -0,0 +1 @@\n+hello\n"
+            . "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n"
+            . "--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n"
+            . $lockedHunk
+        )
+        ->write('gone.txt', "bye\n")
+        ->write('locked/two.txt', "alpha\n");
+    chmod($p->root . '/gone.txt', 0640);
+    chmod($p->root . '/locked', 0555);
+
+    if (!is_writable($p->root . '/locked')) {
+        $results = $p->patcher()->run(true);
+        chmod($p->root . '/locked', 0755);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+        Assert::false(file_exists($p->root . '/new'), 'the created file is gone, and the directories made for it');
+        Assert::same(["bye\n", 0640], $file($p, 'gone.txt'), 'the deleted file is back, mode and all');
+        $written = [];
+        foreach (json_decode(Renderer::json($results, []), true)['patches'] as $reported) {
+            foreach ($reported['targets'] as $target) {
+                $written = array_merge($written, $target['written'] ?? []);
+            }
+        }
+        Assert::same([], $written, 'and --json lists nothing as written');
+        Assert::same([], $recorded($p), 'nothing is recorded as applied');
+    }
+
+    Assert::case('a rollback puts back a file the patch superseded');
+    // A replacement moves the previous version aside and deletes it once the
+    // new one is in. The rollback reversed only APPLIED fragments, so a later
+    // failure left the new version in place under a patch that did not apply.
+    $p = $mirrored('rollback-supersede', 's1.patch')
+        ->write(
+            'vendor/acme/patches/s1.patch',
+            "diff --git a/bin/status b/bin/status\nnew file mode 100755\n--- /dev/null\n+++ b/bin/status\n@@ -0,0 +1 @@\n+v1\n"
+        )
+        ->write('locked/two.txt', "alpha\n");
+    $p->patcher()->run(true);
+    Assert::same(["v1\n", 0755], $file($p, 'bin/status'), 'the first version is installed');
+
+    $p->package('acme/patches', $meta(['patches' => [
+        ['id' => 'S-1', 'source' => 's1.patch'],
+        ['id' => 'S-2', 'source' => 's2.patch'],
+    ]]))->write(
+        'vendor/acme/patches/s2.patch',
+        "diff --git a/bin/status b/bin/status\nnew file mode 100755\n--- /dev/null\n+++ b/bin/status\n@@ -0,0 +1 @@\n+v2\n"
+        . $lockedHunk
+    );
+    chmod($p->root . '/locked', 0555);
+
+    if (!is_writable($p->root . '/locked')) {
+        $results = $p->patcher()->run(true);
+        chmod($p->root . '/locked', 0755);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+        Assert::same(["v1\n", 0755], $file($p, 'bin/status'), 'the previous version is back, executable bit and all');
+        Assert::same([], glob($p->root . '/bin/status.mpi-superseded-*'), 'with nothing left aside');
+        Assert::same(1, count($recorded($p)), 'and only the first patch is on record');
+    }
+
+    Assert::case('a patch that lands everywhere is recorded once it has');
+    $p = $mirrored('atomic-control', 'w.patch')
+        ->write('vendor/acme/patches/w.patch', "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1,2 @@\n one\n+two\n" . $nginxHunk)
+        ->write('one.txt', "one\n")
+        ->write('nginx.conf.sample', "1\n2\n3\n")
+        ->write('vendor/magento/magento2-base/nginx.conf.sample', "1\n2\n3\n");
+    chmod($p->root . '/vendor/magento/magento2-base/nginx.conf.sample', 0640);
+    chmod($p->root . '/nginx.conf.sample', 0604);
+
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'the run is clean');
+    Assert::same("one\ntwo\n", $file($p, 'one.txt')[0], 'the first file is patched');
+    // git apply writes a fresh file, so the served copy's mode is git's to set.
+    Assert::same("1\n2a\n3\n", $file($p, 'nginx.conf.sample')[0], 'and the served copy');
+    Assert::same(["1\n2a\n3\n", 0640], $file($p, 'vendor/magento/magento2-base/nginx.conf.sample'), 'and its mirror, keeping its mode');
+    Assert::same(1, count($recorded($p)), 'and the patch is on record');
+
+    Assert::case('a skipped patch that is present is taken back off disk');
+    // unwanted() is the one function in the codebase that deletes a security
+    // patch, and until now it was exercised only by the Docker acceptance run,
+    // which the lint and analyse jobs do not execute.
+    $p = $project('unwanted')
+        ->root($meta([
+            'trust' => ['acme/*'],
+            'sources' => ['acme/patches' => ['skip' => ['U-1' => 'breaks our checkout']]],
+        ]))
+        ->package('acme/patches', $meta(['patches' => [['id' => 'U-1', 'source' => 'a.patch']]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+    $p->write('a.txt', "one\ntwo\n");
+
+    $results = $p->patcher()->run(true);
+    Assert::same(1, count($results), 'the skipped patch still gets a row');
+    Assert::same(false, $results[0]['applicable'], 'it is not applicable');
+    Assert::contains((string) $results[0]['skipped'], 'breaks our checkout', 'and carries the reason');
+    Assert::same(
+        Fragment::REVERTED,
+        $results[0]['fragments'][0]->verdict(),
+        'the fragment says it was removed'
+    );
+    Assert::same("one\n", (string) file_get_contents($p->root . '/a.txt'), 'and the file really lost it');
+
+    Assert::case('a skipped patch that was never there is not a failure');
+    $p = $project('unwanted-absent')
+        ->root($meta([
+            'trust' => ['acme/*'],
+            'sources' => ['acme/patches' => ['skip' => ['U-1' => 'breaks our checkout']]],
+        ]))
+        ->package('acme/patches', $meta(['patches' => [['id' => 'U-1', 'source' => 'a.patch']]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+    $p->write('a.txt', "one\n");
+
+    $results = $p->patcher()->run(true);
+    Assert::same(
+        Fragment::SKIPPED,
+        $results[0]['fragments'][0]->verdict(),
+        'nothing to remove, and nothing to complain about'
+    );
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'so the run stays clean');
+
+    Assert::case('a skipped patch nobody can classify is a conflict, not a shrug');
+    // Local edits mean the reverse-check fails for a reason other than absence.
+    // Reporting that as "not present" leaves the store running a patch the
+    // project believes it switched off.
+    $p = $project('unwanted-drift')
+        ->root($meta([
+            'trust' => ['acme/*'],
+            'sources' => ['acme/patches' => ['skip' => ['U-1' => 'breaks our checkout']]],
+        ]))
+        ->package('acme/patches', $meta(['patches' => [['id' => 'U-1', 'source' => 'a.patch']]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+    $p->write('a.txt', "something else entirely\n");
+
+    $results = $p->patcher()->run(true);
+    Assert::same(
+        Fragment::CONFLICT,
+        $results[0]['fragments'][0]->verdict(),
+        'nobody can say whether it is applied, so nobody says it is gone'
+    );
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'and the run fails');
+
+    Assert::case('a file a skip emptied is not "the module does not ship this"');
+    // The reversal pass deletes the file when the skipped patch created it.
+    // Anything patched on top then finds nothing there, and an absent target
+    // with a modification hunk otherwise reads as NOT_APPLICABLE — which does
+    // not move the exit code and prints under a green banner. A security patch
+    // reclassified as one that was never needed.
+    $p = $project('vacated')
+        ->root($meta([
+            'trust' => ['acme/*'],
+            'sources' => ['acme/patches' => ['skip' => ['MAKER' => 'we do not want the file']]],
+        ]))
+        ->package('acme/patches', $meta(['patches' => [
+            ['id' => 'MAKER', 'source' => 'make.patch'],
+            ['id' => 'ONTOP', 'source' => 'ontop.patch'],
+        ]]));
+    $p->write('vendor/acme/patches/make.patch', "--- /dev/null\n+++ b/made.txt\n@@ -0,0 +1 @@\n+hello\n");
+    $p->write('vendor/acme/patches/ontop.patch', "--- a/made.txt\n+++ b/made.txt\n@@ -1 +1,2 @@\n hello\n+world\n");
+    $p->write('made.txt', "hello\n");
+
+    $results = [];
+    foreach ($p->patcher()->run(true) as $result) {
+        $results[(string) $result['id']] = $result;
+    }
+
+    Assert::same(
+        Fragment::REVERTED,
+        $results['MAKER']['fragments'][0]->verdict(),
+        'the skipped patch is removed, which deletes the file'
+    );
+    Assert::same(false, file_exists($p->root . '/made.txt'), 'the file really is gone');
+    Assert::same(
+        Fragment::CONFLICT,
+        $results['ONTOP']['fragments'][0]->verdict(),
+        'and the patch that needed it says so, rather than shrugging'
+    );
+    Assert::contains(
+        (string) $results['ONTOP']['fragments'][0]->reason(),
+        'removed by reverting',
+        'naming the skip that took it away'
+    );
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run does not exit 0');
+
+    Assert::case('the old isolated/emergency keys are refused, not ignored');
+    // Silently skipping a block named "isolated" would drop every patch in it
+    // and exit 0 — a package that had been patching correctly for a year would
+    // go quiet on upgrade, which is the exact failure this plugin exists to
+    // prevent.
+    $p = $project('legacy-keys')
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('acme/patches', $meta(['lines' => [
+            '2.4.8-p5' => [
+                'base' => ['magento/magento2-base' => '2.4.8-p5'],
+                'isolated' => [['id' => 'L-1', 'source' => 'a.patch']],
+            ],
+        ]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+
+    $collector = $p->collector();
+    $declarations = $collector->collect();
+    Assert::same(1, count($collector->errors()), 'the old key is reported');
+    Assert::contains($collector->errors()[0], 'uses "isolated"', 'and named');
+    Assert::contains($collector->errors()[0], 'one "patches" list', 'with what to do instead');
+    Assert::same([], $declarations, 'and nothing is silently declared from it');
+
+    Assert::case('a line without cumulative does not have to be a chain');
+    // Independent patches for one base version are ordinary. Only a line that
+    // says it is cumulative gets the every-patch-but-one-needs-depends rule.
+    $p = $project('non-cumulative')
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('acme/patches', $meta(['lines' => [
+            '2.4.8-p5' => [
+                'base' => ['magento/magento2-base' => '2.4.8-p5'],
+                'patches' => [
+                    ['id' => 'I-1', 'source' => 'a.patch'],
+                    ['id' => 'I-2', 'source' => 'a.patch'],
+                    ['id' => 'I-3', 'source' => 'a.patch'],
+                ],
+            ],
+        ]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+
+    $collector = $p->collector();
+    $declarations = $collector->collect();
+    Assert::same([], $collector->errors(), 'three roots is fine when nothing claims a chain');
+    Assert::same(3, count($declarations), 'and all three are declared');
+
+    Assert::case('a cumulative line derives its chain from the order listed');
+    // Nothing declares depends, and the edges still exist. That is the point:
+    // a derived edge cannot be forgotten the way a written one could.
+    $p = $project('cumulative-chain')
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('acme/patches', $meta(['lines' => [
+            '2.4.8-p5' => [
+                'base' => ['magento/magento2-base' => '2.4.8-p5'],
+                'cumulative' => true,
+                'patches' => [
+                    ['id' => 'L-1', 'source' => 'a.patch'],
+                    ['id' => 'L-2', 'source' => 'a.patch'],
+                    ['id' => 'L-3', 'source' => 'a.patch'],
+                ],
+            ],
+        ]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+
+    $collector = $p->collector();
+    $declarations = $collector->collect();
+    Assert::same([], $collector->errors(), 'no complaints');
+
+    $entries = [];
+    foreach ($p->patcher()->catalogue() as $entry) {
+        $entries[(string) $entry['id']] = $entry;
+    }
+    Assert::same([], $entries['L-1']['depends'], 'the first depends on nothing');
+    Assert::same(['L-1'], $entries['L-2']['depends'], 'the second on the first');
+    Assert::same(['L-2'], $entries['L-3']['depends'], 'the third on the second');
+
+    Assert::case('skipping a link in a derived chain still cascades');
+    $p = $project('cumulative-skip')
+        ->root($meta([
+            'trust' => ['acme/*'],
+            'sources' => ['acme/patches' => ['skip' => ['L-2@2.4.8-p5' => 'breaks checkout']]],
+        ]))
+        ->package('acme/patches', $meta(['lines' => [
+            '2.4.8-p5' => [
+                'base' => ['magento/magento2-base' => '2.4.8-p5'],
+                'cumulative' => true,
+                'patches' => [
+                    ['id' => 'L-1', 'source' => 'a.patch'],
+                    ['id' => 'L-2', 'source' => 'a.patch'],
+                    ['id' => 'L-3', 'source' => 'a.patch'],
+                ],
+            ],
+        ]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+
+    $states = [];
+    foreach ($p->collector()->collect() as $declaration) {
+        $states[(string) $declaration['id']] = $declaration['skipped'];
+    }
+    Assert::same(null, $states['L-1'], 'the one before it is untouched');
+    Assert::contains((string) $states['L-2'], 'breaks checkout', 'the named one carries the reason');
+    Assert::contains((string) $states['L-3'], 'depends on', 'and the one after it goes too');
+
+    Assert::case('depends and cumulative are not both');
+    // Two ways of saying the same thing, disagreeing silently, is worse than
+    // either. The line already said the order; a per-patch edge can only
+    // contradict it.
+    $p = $project('cumulative-and-depends')
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('acme/patches', $meta(['lines' => [
+            '2.4.8-p5' => [
+                'base' => ['magento/magento2-base' => '2.4.8-p5'],
+                'cumulative' => true,
+                'patches' => [
+                    ['id' => 'D-1', 'source' => 'a.patch'],
+                    ['id' => 'D-2', 'source' => 'a.patch', 'depends' => ['D-1']],
+                ],
+            ],
+        ]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+
+    $collector = $p->collector();
+    $collector->collect();
+    Assert::same(1, count($collector->errors()), 'reported');
+    Assert::contains($collector->errors()[0], 'cumulative line', 'and says which rule it broke');
+
+    Assert::case('the catalogue refuses to call an unreadable patch applicable');
+    // magento-patches:list never runs runOne(), so it never saw an empty or truncated
+    // diff: it printed "0 targets — applies here" and exited 0, while status
+    // and verify called the same file a config error and exited 3.
+    $p = $project('catalogue-unreadable')
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('acme/patches', $meta(['patches' => [['id' => 'E-1', 'source' => 'empty.patch']]]));
+    $p->write('vendor/acme/patches/empty.patch', '');
+
+    $patcher = $p->patcher();
+    $entries = $patcher->catalogue();
+    Assert::same(1, count($entries), 'the patch is still listed');
+    Assert::same(false, $entries[0]['applicable'], 'but not as something that applies here');
+    Assert::contains((string) $entries[0]['reason'], 'could not be read', 'and says why');
+    Assert::same(1, count($patcher->errors()), 'and it is a configuration error, so the command exits 3');
+
+    Assert::case('the catalogue names what each patch depends on');
+    // `depends` holds owner-scoped origin strings, not indices. Typed as int,
+    // this was a TypeError out of magento-patches:list — and magento-patches:list is the one
+    // command that answers before anything is installed, so a crash there is
+    // the first thing anyone evaluating the package sees.
+    $p = $project('catalogue-depends')
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('acme/patches', $meta(['lines' => [
+            '2.4.8-p5' => [
+                'base' => ['magento/magento2-base' => '2.4.8-p5'],
+                'cumulative' => true, 'patches' => [
+                    ['id' => 'C-1', 'source' => 'a.patch'],
+                    ['id' => 'C-2', 'source' => 'a.patch', 'depends' => ['C-1']],
+                ],
+            ],
+        ]]));
+    $p->write('vendor/acme/patches/a.patch', $patch);
+
+    $entries = [];
+    foreach ($p->patcher()->catalogue() as $entry) {
+        $entries[(string) $entry['id']] = $entry;
+    }
+
+    Assert::same(2, count($entries), 'both patches are catalogued');
+    Assert::same([], $entries['C-1']['depends'], 'the first depends on nothing');
+    Assert::same(['C-1'], $entries['C-2']['depends'], 'and the second names an id, not an index');
+
     // ------------------------------------------------- patches from several sources
 
     // The case behind all of these: a month a package cannot ship (Adobe keeps
@@ -1662,6 +2157,203 @@ return [
         Assert::true(microtime(true) - $started < 30, 'and quick');
     }
 
+    // ------------------------------------------------------- root-file mirrors
+
+    // A root file's other copy is whatever magento-composer-installer deploys
+    // it from. aaa/ sorts ahead of magento/, which is what let a first match
+    // pick the decoy on a real 2.4.9 store.
+    $mirrored = static function (string $name, string $type, array $rootExtra = []) use ($project, $meta, $ten): Project {
+        $p = $project($name)
+            ->root(array_merge($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]), $rootExtra))
+            ->package('aaa/analytics', ['map' => [['decoy', 'nginx.conf.sample']]], [], $type)
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component');
+
+        return $p->write('nginx.conf.sample', $ten)
+            ->write('vendor/magento/magento2-base/nginx.conf.sample', $ten)
+            ->write('vendor/aaa/analytics/decoy', $ten)
+            ->write('own.patch', "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n");
+    };
+    $patched = str_replace("2\n", "2a\n", $ten);
+
+    Assert::case('mirrors: an ordinary library\'s extra.map is not a deploy mapping');
+    $p = $mirrored('mirror-library', 'library');
+    $patcher = $p->patcher();
+    $results = $outcome($patcher->run(true));
+    Assert::same([], $patcher->errors(), 'nothing to complain about');
+    Assert::same($patched, (string) file_get_contents($p->root . '/nginx.conf.sample'), 'the served copy is patched');
+    Assert::same(
+        $patched,
+        (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'),
+        'and so is magento2-base\'s, which deploys it'
+    );
+    Assert::same($ten, (string) file_get_contents($p->root . '/vendor/aaa/analytics/decoy'), 'the library\'s decoy is left alone');
+    Assert::true(empty($results['project/root OWN-1']['blocked']), 'and the patch is not refused');
+
+    Assert::case('mirrors: two packages deploying one root file is a configuration error, and nothing is written');
+    $p = $mirrored('mirror-contested', 'magento2-component');
+    $patcher = $p->patcher();
+    $results = $outcome($patcher->run(true));
+    Assert::same($ten, (string) file_get_contents($p->root . '/nginx.conf.sample'), 'the served copy is not written');
+    Assert::same($ten, (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'), 'nor magento2-base\'s');
+    Assert::same($ten, (string) file_get_contents($p->root . '/vendor/aaa/analytics/decoy'), 'nor the other package\'s');
+    Assert::true(!empty($results['project/root OWN-1']['blocked']), 'the patch is refused');
+    Assert::contains(
+        (string) $results['project/root OWN-1']['reason'],
+        'nginx.conf.sample is deployed to the project root by both',
+        'and says why'
+    );
+    $errors = implode("\n", $patcher->errors());
+    Assert::contains($errors, 'aaa/analytics', 'the error names one claimant');
+    Assert::contains($errors, 'magento/magento2-base', 'and the other');
+    Assert::contains($errors, 'extra.magento-deploy-ignore', 'and how to settle it');
+    $results = $outcome($p->patcher()->run(false));
+    Assert::true(!empty($results['project/root OWN-1']['blocked']), 'status refuses it too');
+
+    Assert::case('mirrors: the root\'s magento-deploy-ignore settles a contest');
+    $p = $mirrored('mirror-ignored', 'magento2-component', ['magento-deploy-ignore' => ['aaa/analytics' => ['/nginx.conf.sample']]]);
+    $patcher = $p->patcher();
+    $patcher->run(true);
+    Assert::same([], $patcher->errors(), 'no contest once one claimant is ignored');
+    Assert::same(
+        $patched,
+        (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'),
+        'magento2-base\'s copy is patched'
+    );
+    Assert::same($ten, (string) file_get_contents($p->root . '/vendor/aaa/analytics/decoy'), 'the ignored one is not');
+
+    Assert::case('mirrors: a store ignoring magento2-base\'s copy of a file still gets both copies patched');
+    $p = $mirrored('mirror-own-copy', 'library', ['magento-deploy-ignore' => ['magento/magento2-base' => ['/nginx.conf.sample']]]);
+    $patcher = $p->patcher();
+    $patcher->run(true);
+    Assert::same([], $patcher->errors(), 'nothing to complain about');
+    Assert::same($patched, (string) file_get_contents($p->root . '/nginx.conf.sample'), 'the store\'s own copy is patched');
+    Assert::same(
+        $patched,
+        (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'),
+        'and magento2-base\'s, as before'
+    );
+
+    Assert::case('mirrors: the root\'s magento-map-overwrite replaces a package\'s map');
+    $p = $mirrored('mirror-overwrite', 'magento2-component', ['magento-map-overwrite' => ['AAA/Analytics' => []]]);
+    $patcher = $p->patcher();
+    $patcher->run(true);
+    Assert::same([], $patcher->errors(), 'an emptied map claims nothing, whatever the key\'s case');
+    Assert::same(
+        $patched,
+        (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'),
+        'magento2-base\'s copy is patched'
+    );
+
+    // Adobe Commerce: magento2-base and magento2-ee-base both map all of
+    // pub/errors, but only base ships processor.php, which StyleSmuggler
+    // patches. Contesting the directory refused it on every Commerce store.
+    $processor = "<?php\n\$a = 1;\n";
+    $commerce = static function (string $name, bool $eeShipsIt) use ($project, $meta, $processor): Project {
+        $p = $project($name)
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->package('magento/magento2-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component')
+            ->package('magento/magento2-ee-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component')
+            ->write('vendor/magento/magento2-base/pub/errors/processor.php', $processor)
+            ->write('vendor/magento/magento2-ee-base/pub/errors/enterprise/page.phtml', "ee\n")
+            ->write('pub/errors/processor.php', $processor)
+            ->write('pub/errors/enterprise/page.phtml', "ee\n")
+            ->write('own.patch', "--- a/pub/errors/processor.php\n+++ b/pub/errors/processor.php\n@@ -1,2 +1,2 @@\n <?php\n-\$a = 1;\n+\$a = 2;\n");
+
+        return $eeShipsIt ? $p->write('vendor/magento/magento2-ee-base/pub/errors/processor.php', $processor) : $p;
+    };
+
+    Assert::case('mirrors: two packages deploying one directory contest only the files both ship');
+    $p = $commerce('mirror-commerce', false);
+    $patcher = $p->patcher();
+    $results = $patcher->run(true);
+    Assert::same([], $patcher->errors(), 'no configuration error');
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'the patch applies');
+    Assert::same("<?php\n\$a = 2;\n", (string) file_get_contents($p->root . '/pub/errors/processor.php'), 'to the served copy');
+    Assert::same(
+        "<?php\n\$a = 2;\n",
+        (string) file_get_contents($p->root . '/vendor/magento/magento2-base/pub/errors/processor.php'),
+        'and to magento2-base\'s, the package that ships it'
+    );
+    Assert::false(file_exists($p->root . '/vendor/magento/magento2-ee-base/pub/errors/processor.php'), 'not to one that does not');
+
+    Assert::case('mirrors: a served root file that has gone missing is not "not present"');
+    // A failed update can leave magento2-base installed with its root files
+    // never deployed. Calling the served copy "not present in this
+    // installation" passed verify on a store with no pub/index.php. The patch
+    // goes to the package copy, which the next deploy serves from, with a
+    // warning: refusing it blocked every month built on it.
+    $gone = static function (string $name, array $rootExtra, bool $shipped) use ($project, $meta, $ten): Project {
+        $p = $project($name)
+            ->root(array_merge($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]), $rootExtra))
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component')
+            ->write('own.patch', "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n");
+
+        return $shipped ? $p->write('vendor/magento/magento2-base/nginx.conf.sample', $ten) : $p;
+    };
+    $patcher = $gone('mirror-gone', [], true)->patcher();
+    Assert::same(Renderer::UNAPPLIED, Renderer::exitCode($patcher->run(false)), 'verify fails while the package copy is unpatched');
+    Assert::contains(
+        implode("\n", array_column($patcher->advisories(), 'message')),
+        'composer reinstall magento/magento2-base',
+        'and warns how to put the served copy back'
+    );
+    $p = $gone('mirror-gone-apply', [], true);
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'an apply patches the package copy');
+    Assert::contains((string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'), '2a', 'which is where the next deploy comes from');
+    $results = $gone('mirror-gone-ignored', ['magento-deploy-ignore' => ['magento/magento2-base' => ['/nginx.conf.sample']]], true)->patcher()->run(false);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'control: a file the store has the installer ignore can be absent');
+    $results = $gone('mirror-gone-unshipped', [], false)->patcher()->run(false);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'control: so can one no package ships');
+
+    Assert::case('mirrors: a patch deleting a root file deletes both copies');
+    // The copies are in step, so the package copy follows the served one. A
+    // deleted primary has nothing to copy, and the patch could never apply.
+    $deleting = static function (string $name) use ($project, $meta): Project {
+        return $project($name)
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->package('magento/magento2-base', ['map' => [['pub/old.php', 'pub/old.php']]], [], 'magento2-component')
+            ->write('own.patch', "diff --git a/pub/old.php b/pub/old.php\ndeleted file mode 100644\n--- a/pub/old.php\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n")
+            ->write('pub/old.php', "old\n")
+            ->write('vendor/magento/magento2-base/pub/old.php', "old\n");
+    };
+    $p = $deleting('mirror-delete');
+    Assert::same(Renderer::UNAPPLIED, Renderer::exitCode($p->patcher()->run(false)), 'a report says it is not applied yet');
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'the patch applies');
+    Assert::false(file_exists($p->root . '/pub/old.php'), 'the served copy is gone');
+    Assert::false(file_exists($p->root . '/vendor/magento/magento2-base/pub/old.php'), 'and so is magento2-base\'s');
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), 'the next verify is clean');
+    $written = 0;
+    foreach ($p->patcher()->run(true) as $result) {
+        foreach ($result['fragments'] as $fragment) {
+            $written += $fragment->wasWritten() ? 1 : 0;
+        }
+    }
+    Assert::same(0, $written, 'and a further apply writes nothing');
+
+    $p = $deleting('mirror-delete-rollback');
+    $p->write('own.patch', (string) file_get_contents($p->root . '/own.patch') . "--- a/locked/two.txt\n+++ b/locked/two.txt\n@@ -1 +1,2 @@\n alpha\n+beta\n")
+        ->write('locked/two.txt', "alpha\n");
+    chmod($p->root . '/locked', 0555);
+
+    if (!is_writable($p->root . '/locked')) {
+        $results = $p->patcher()->run(true);
+        chmod($p->root . '/locked', 0755);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'a later file failing fails the run');
+        Assert::same("old\n", (string) @file_get_contents($p->root . '/pub/old.php'), 'and the served copy comes back');
+        Assert::same("old\n", (string) @file_get_contents($p->root . '/vendor/magento/magento2-base/pub/old.php'), 'and so does magento2-base\'s');
+    }
+
+    Assert::case('mirrors: list refuses a contested patch, as status does');
+    $p = $commerce('mirror-commerce-contested', true);
+    $patcher = $p->patcher();
+    $entries = $patcher->catalogue();
+    Assert::false($entries[0]['applicable'], 'list refuses it');
+    Assert::contains((string) $entries[0]['reason'], 'pub/errors/processor.php is deployed to the project root by both', 'and says why');
+    Assert::true($patcher->errors() !== [], 'and reports the configuration error');
+    $results = $p->patcher()->run(false);
+    Assert::true(!empty($results[0]['blocked']), 'status refuses it too');
+
 },
 
 'plugin' => static function (Sandbox $sandbox): void {
@@ -1839,6 +2531,441 @@ return [
     );
 },
 
+'writes' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+    $verdicts = static function (array $results): array {
+        $out = [];
+        foreach ($results as $result) {
+            foreach ($result['fragments'] as $fragment) {
+                $out[$fragment->target()] = $fragment->verdict();
+            }
+        }
+
+        return $out;
+    };
+
+    Assert::case('symlink deploy: a skipped patch comes off the one file both paths name');
+    // The served copy is a link to magento2-base's, so the copy and its
+    // mirror are one file. Reverting it as both reverted it twice, the second
+    // failed, and the rollback put the patch back on every run.
+    $vendor = 'vendor/magento/magento2-base/nginx.conf.sample';
+    $linked = static function (string $name, array $rootExtra, bool $link, string $contents) use ($sandbox, $meta, $vendor): Project {
+        $p = (new Project($sandbox, $name))
+            ->root($meta($rootExtra))
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component')
+            ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]))
+            ->write('vendor/acme/patches/p.patch', "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n")
+            ->write($vendor, $contents);
+
+        if ($link) {
+            symlink($vendor, $p->root . '/nginx.conf.sample');
+        } else {
+            $p->write('nginx.conf.sample', $contents);
+        }
+
+        return $p;
+    };
+    $skip = ['trust' => ['acme/*'], 'sources' => ['acme/patches' => ['skip' => ['P-1' => 'breaks us']]]];
+
+    foreach (['separate copies' => false, 'a symlinked copy' => true] as $how => $link) {
+        $p = $linked('symlink-skip-' . ($link ? 'link' : 'copy'), $skip, $link, "1\n2a\n3\n");
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': it comes off');
+        Assert::same("1\n2\n3\n", (string) file_get_contents($p->root . '/' . $vendor), $how . ': and is gone');
+        Assert::same("1\n2\n3\n", (string) file_get_contents($p->root . '/nginx.conf.sample'), $how . ': from the served copy too');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), $how . ': and the next status is clean');
+    }
+
+    $p = $linked('symlink-apply', ['trust' => ['acme/*']], true, "1\n2\n3\n");
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'control: applying through the link is clean');
+    Assert::true(is_link($p->root . '/nginx.conf.sample'), 'control: and the link is kept');
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), 'control: and so is the next verify');
+
+    Assert::case('a package deploying to a parent of vendor/ cannot take another package\'s copy');
+    // A destination of `vendor` or `vendor/magento` sits above magento2-base's
+    // install directory, so a patch naming the vendor copy took the intruder's
+    // path, which does not exist, as its other copy. The served file was never
+    // patched, and verify said it was.
+    $base = 'vendor/magento/magento2-base/pub/errors/processor.php';
+    $hijacked = static function (string $name, ?array $map) use ($sandbox, $meta, $base): Project {
+        $p = (new Project($sandbox, $name))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->package('magento/magento2-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component');
+
+        if ($map !== null) {
+            $p->package('zzz/widget', ['map' => $map], [], 'magento2-component')->write('vendor/zzz/widget/assets/readme.txt', "x\n");
+        }
+
+        return $p->write($base, "<?php\n\$a = 1;\n")
+            ->write('pub/errors/processor.php', "<?php\n\$a = 1;\n")
+            ->write('own.patch', "--- a/$base\n+++ b/$base\n@@ -1,2 +1,2 @@\n <?php\n-\$a = 1;\n+\$a = 2;\n");
+    };
+
+    foreach (['no other package' => null, 'a map onto vendor' => [['assets', 'vendor']], 'a map onto vendor/magento' => [['assets', 'vendor/magento']]] as $how => $map) {
+        $p = $hijacked('hijack-' . md5($how), $map);
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': it applies');
+        Assert::same("<?php\n\$a = 2;\n", (string) file_get_contents($p->root . '/' . $base), $how . ': to the package copy');
+        Assert::same("<?php\n\$a = 2;\n", (string) file_get_contents($p->root . '/pub/errors/processor.php'), $how . ': and the served copy');
+    }
+
+    // A patch spans modules, and a store only has some of them. A file in a
+    // module it does not install is not its to write, in either direction.
+    $modify = "--- a/vendor/magento/module-present/a.php\n+++ b/vendor/magento/module-present/a.php\n@@ -1 +1,2 @@\n one\n+two\n";
+    $absentStore = static function (string $name, string $patch, array $rootExtra = []) use ($sandbox, $meta): Project {
+        return (new Project($sandbox, $name))
+            ->root($meta(array_merge(['trust' => ['acme/*']], $rootExtra)))
+            ->package('acme/patches', $meta(['patches' => [['id' => 'C-1', 'source' => 'c.patch']]]))
+            ->package('magento/module-present', [])
+            ->write('vendor/acme/patches/c.patch', $patch)
+            ->write('vendor/magento/module-present/a.php', "one\n");
+    };
+
+    Assert::case('a skipped patch deleting a file from a module this store does not install recreates nothing');
+    // Reversing a deletion checks out wherever the file is absent, so the skip
+    // read as "still present" and taking it off wrote the vulnerable file back.
+    $delete = "diff --git a/vendor/magento/module-absent/Old.php b/vendor/magento/module-absent/Old.php\ndeleted file mode 100644\n"
+        . "--- a/vendor/magento/module-absent/Old.php\n+++ /dev/null\n@@ -1 +0,0 @@\n-<?php // vulnerable\n";
+    $p = $absentStore('absent-skip-delete', $delete, ['sources' => ['acme/patches' => ['skip' => ['C-1' => 'not for us']]]]);
+    $results = $p->patcher()->run(false);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'status is clean');
+    Assert::same(['vendor/magento/module-absent/Old.php' => Fragment::SKIPPED], $verdicts($results), 'and calls it skipped, not still present');
+    $p->patcher()->run(true);
+    Assert::false(file_exists($p->root . '/vendor/magento/module-absent'), 'apply writes nothing there');
+
+    $p = $absentStore('present-skip-delete', str_replace('module-absent', 'module-present', $delete), ['sources' => ['acme/patches' => ['skip' => ['C-1' => 'not for us']]]]);
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'control: in a module it does install, the skip comes off');
+    Assert::same("<?php // vulnerable\n", (string) @file_get_contents($p->root . '/vendor/magento/module-present/Old.php'), 'control: and the file is back, as the store asked');
+
+    Assert::case('a patch creating a file in a module this store does not install leaves it alone');
+    $create = "diff --git a/vendor/magento/module-absent/New.php b/vendor/magento/module-absent/New.php\nnew file mode 100644\n"
+        . "--- /dev/null\n+++ b/vendor/magento/module-absent/New.php\n@@ -0,0 +1 @@\n+<?php // new\n";
+    $p = $absentStore('absent-create', $modify . $create);
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'the patch applies');
+    Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/vendor/magento/module-present/a.php'), 'to the module it does install');
+    Assert::false(file_exists($p->root . '/vendor/magento/module-absent'), 'and writes nothing into the one it does not');
+    Assert::same(Fragment::NOT_APPLICABLE, $verdicts($results)['vendor/magento/module-absent/New.php'], 'which is not applicable here');
+
+    $p = $absentStore('present-create', $modify . str_replace('module-absent', 'module-present', $create));
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'control: in a module it does install');
+    Assert::same("<?php // new\n", (string) @file_get_contents($p->root . '/vendor/magento/module-present/New.php'), 'control: the file is created');
+
+    Assert::case('magento2-base installed from a path repository keeps both copies in step');
+    // Its install path resolves through the symlink a path repository leaves,
+    // so a patch naming the vendor path matched no mapping, patched only the
+    // package copy, and verify passed with the served file unpatched.
+    foreach (['the root path' => 'nginx.conf.sample', 'the vendor path' => 'vendor/magento/magento2-base/nginx.conf.sample'] as $how => $target) {
+        $p = (new Project($sandbox, 'path-repo-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->write('packages/base/nginx.conf.sample', "1\n2\n3\n")
+            ->write('nginx.conf.sample', "1\n2\n3\n")
+            ->write('own.patch', "--- a/$target\n+++ b/$target\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n");
+        mkdir($p->root . '/vendor/magento', 0777, true);
+        symlink('../../packages/base', $p->root . '/vendor/magento/magento2-base');
+        $p->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component');
+
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'patching ' . $how . ' applies');
+        Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/nginx.conf.sample'), 'patching ' . $how . ': to the served copy');
+        Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/packages/base/nginx.conf.sample'), 'patching ' . $how . ': and the package copy');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), 'patching ' . $how . ': and the next verify is clean');
+    }
+
+    Assert::case('a mode change is applied, not read as already there');
+    // Reverse-checking a mode change only warns when the mode differs, so a
+    // fragment that only made a file executable read as already applied.
+    foreach (['a mode change alone' => '', 'a mode change with content' => "--- a/bin/run\n+++ b/bin/run\n@@ -1 +1 @@\n-a\n+b\n"] as $how => $content) {
+        $p = (new Project($sandbox, 'mode-' . md5($how)))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('acme/patches', $meta(['patches' => [['id' => 'M-1', 'source' => 'm.patch']]]))
+            ->write('vendor/acme/patches/m.patch', "diff --git a/bin/run b/bin/run\nold mode 100644\nnew mode 100755\n" . $content)
+            ->write('bin/run', "a\n");
+        chmod($p->root . '/bin/run', 0644);
+        Assert::same(Renderer::UNAPPLIED, Renderer::exitCode($p->patcher()->run(false)), $how . ': a report says it is not applied');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': it applies');
+        clearstatcache();
+        Assert::same(0755, fileperms($p->root . '/bin/run') & 0777, $how . ': and the file is executable');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), $how . ': and the next verify is clean');
+    }
+
+    Assert::case('a rolled-back rename puts the old name back');
+    // The journal kept the new name only. Rolling back deleted it and never
+    // restored the file git apply had renamed away, and the next run, finding
+    // neither name, called the patch not applicable and exited 0.
+    $rename = "diff --git a/old.php b/new.php\nsimilarity index 80%\nrename from old.php\nrename to new.php\n"
+        . "--- a/old.php\n+++ b/new.php\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+    $renaming = static function (string $name, string $patch) use ($sandbox, $meta): Project {
+        return (new Project($sandbox, $name))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('acme/patches', $meta(['patches' => [['id' => 'R-1', 'source' => 'r.patch']]]))
+            ->write('vendor/acme/patches/r.patch', $patch)
+            ->write('old.php', "a\nb\nc\n")
+            ->write('locked/two.txt', "alpha\n");
+    };
+
+    $p = $renaming('rename-control', $rename);
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'control: a rename applies');
+    Assert::same(["a\nB\nc\n", false], [@file_get_contents($p->root . '/new.php'), file_exists($p->root . '/old.php')], 'control: under its new name');
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), 'control: and the next verify is clean');
+
+    $p = $renaming('rename-rollback', $rename . "--- a/locked/two.txt\n+++ b/locked/two.txt\n@@ -1 +1,2 @@\n alpha\n+beta\n");
+    chmod($p->root . '/locked', 0555);
+
+    if (!is_writable($p->root . '/locked')) {
+        $results = $p->patcher()->run(true);
+        chmod($p->root . '/locked', 0755);
+        Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'a later file failing fails the run');
+        Assert::same("a\nb\nc\n", (string) @file_get_contents($p->root . '/old.php'), 'and the store\'s file is back under its old name');
+        Assert::false(file_exists($p->root . '/new.php'), 'with nothing left under the new one');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'and the next run applies it');
+        Assert::same("a\nB\nc\n", (string) @file_get_contents($p->root . '/new.php'), 'under its new name');
+    }
+
+    Assert::case('a rename of a file with another copy is refused, not half done');
+    // git apply renames one path. Keeping a root file's other copy in step
+    // would mean mapping the old name too, and no Adobe patch renames a file.
+    $p = (new Project($sandbox, 'rename-mapped'))
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('magento/magento2-base', ['map' => [['pub/old.php', 'pub/old.php'], ['pub/new.php', 'pub/new.php']]], [], 'magento2-component')
+        ->package('acme/patches', $meta(['patches' => [['id' => 'R-1', 'source' => 'r.patch']]]))
+        ->write('vendor/acme/patches/r.patch', str_replace(['old.php', 'new.php'], ['pub/old.php', 'pub/new.php'], $rename))
+        ->write('pub/old.php', "a\nb\nc\n")
+        ->write('vendor/magento/magento2-base/pub/old.php', "a\nb\nc\n");
+    $results = $p->patcher()->run(true);
+    Assert::same(Renderer::CONFLICT, Renderer::exitCode($results), 'the run fails');
+    Assert::contains((string) $results[0]['fragments'][0]->reason(), 'renames pub/old.php', 'and says why');
+    Assert::same(
+        ["a\nb\nc\n", "a\nb\nc\n", false],
+        [@file_get_contents($p->root . '/pub/old.php'), @file_get_contents($p->root . '/vendor/magento/magento2-base/pub/old.php'), file_exists($p->root . '/pub/new.php')],
+        'with nothing written'
+    );
+
+    Assert::case('a missing copy of a root file: the other copy is patched, and the chain carries on');
+    // A store without its served nginx.conf.sample used to refuse the month
+    // that patches it, and every month built on it was blocked behind it.
+    $nginxHunk = "--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n";
+    $chainStore = static function (string $name, bool $served, string $packageCopy, array $rootExtra = []) use ($sandbox, $meta, $nginxHunk): Project {
+        $p = (new Project($sandbox, $name))
+            ->root(array_merge($meta(['trust' => ['acme/*']]), $rootExtra))
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component')
+            ->package('magento/module-present', [])
+            ->package('acme/patches', $meta(['lines' => ['L' => [
+                'base' => ['acme/patches' => '*'],
+                'cumulative' => true,
+                'patches' => [['id' => 'M-1', 'source' => 'm1.patch'], ['id' => 'M-2', 'source' => 'm2.patch']],
+            ]]]))
+            ->write('vendor/acme/patches/m1.patch', $nginxHunk . "--- a/vendor/magento/module-present/a.php\n+++ b/vendor/magento/module-present/a.php\n@@ -1 +1,2 @@\n one\n+two\n")
+            ->write('vendor/acme/patches/m2.patch', "--- a/vendor/magento/module-present/b.php\n+++ b/vendor/magento/module-present/b.php\n@@ -1 +1,2 @@\n one\n+two\n")
+            ->write('vendor/magento/module-present/a.php', "one\n")
+            ->write('vendor/magento/module-present/b.php', "one\n")
+            ->write('vendor/magento/magento2-base/nginx.conf.sample', $packageCopy);
+
+        return $served ? $p->write('nginx.conf.sample', $packageCopy) : $p;
+    };
+    $notices = static function (Patcher $patcher): string {
+        return implode("\n", array_column($patcher->advisories(), 'message'));
+    };
+
+    $p = $chainStore('missing-served-control', true, "1\n2\n3\n");
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'control: with both copies, both months apply');
+
+    foreach (['already patched' => "1\n2a\n3\n", 'unpatched' => "1\n2\n3\n"] as $how => $packageCopy) {
+        $p = $chainStore('missing-served-' . md5($how), false, $packageCopy);
+        $patcher = $p->patcher();
+        $results = $patcher->run(true);
+        Assert::same(Renderer::OK, Renderer::exitCode($results), $how . ': the apply succeeds');
+        Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'), $how . ': the package copy, the next deploy\'s source, carries the patch');
+        Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/vendor/magento/module-present/b.php'), $how . ': and the month built on it is not blocked');
+        Assert::false(file_exists($p->root . '/nginx.conf.sample'), $how . ': the served copy is not conjured up');
+        Assert::contains($notices($patcher), 'composer reinstall magento/magento2-base', $how . ': a warning says how to put it back');
+        $patcher = $p->patcher();
+        Assert::same(Renderer::OK, Renderer::exitCode($patcher->run(false)), $how . ': verify passes, as the patch is where it can be');
+        Assert::contains($notices($patcher), 'nginx.conf.sample', $how . ': and still warns, naming the file');
+    }
+
+    $p = $chainStore('missing-served-ignored', false, "1\n2\n3\n", ['magento-deploy-ignore' => ['magento/magento2-base' => ['/nginx.conf.sample']]]);
+    $patcher = $p->patcher();
+    Assert::same(Renderer::OK, Renderer::exitCode($patcher->run(true)), 'control: a file the store has the installer ignore can be absent');
+    Assert::same("1\n2\n3\n", (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'), 'control: and its package copy is left alone');
+    Assert::false(strpos($notices($patcher), 'composer reinstall') !== false, 'control: without a warning');
+
+    foreach (['root path' => 'pub/errors/processor.php', 'vendor path' => 'vendor/magento/magento2-base/pub/errors/processor.php'] as $how => $target) {
+        // The other way round: magento2-base's copy is gone and the served one is not.
+        $p = (new Project($sandbox, 'missing-package-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->package('magento/magento2-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component')
+            ->write('pub/errors/processor.php', "<?php\n\$a = 1;\n")
+            ->write('vendor/magento/magento2-base/pub/errors/other.php', "x\n")
+            ->write('own.patch', "--- a/$target\n+++ b/$target\n@@ -1,2 +1,2 @@\n <?php\n-\$a = 1;\n+\$a = 2;\n");
+        Assert::same(Renderer::UNAPPLIED, Renderer::exitCode($p->patcher()->run(false)), $how . ': verify does not pass an unpatched served file');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': an apply patches it');
+        Assert::same("<?php\n\$a = 2;\n", (string) file_get_contents($p->root . '/pub/errors/processor.php'), $how . ': the served copy');
+    }
+
+    Assert::case('a file two months create, in a module this store does not install');
+    // The later creator is not installed here, so it never lands, and the
+    // earlier one was flipped to "the patch that replaces this one did not
+    // apply": exit 1 on every apply, while verify said 0.
+    $create = static function (string $module, string $body): string {
+        return "diff --git a/vendor/magento/$module/New.php b/vendor/magento/$module/New.php\nnew file mode 100644\n"
+            . "--- /dev/null\n+++ b/vendor/magento/$module/New.php\n@@ -0,0 +1 @@\n+$body\n";
+    };
+    foreach (['module-present' => true, 'module-absent' => false] as $module => $installed) {
+        $p = (new Project($sandbox, 'supersede-' . $module))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/module-present', [])
+            ->package('acme/patches', $meta(['lines' => ['L' => [
+                'base' => ['acme/patches' => '*'],
+                'cumulative' => true,
+                'patches' => [['id' => 'S-1', 'source' => 's1.patch'], ['id' => 'S-2', 'source' => 's2.patch']],
+            ]]]))
+            ->write('vendor/acme/patches/s1.patch', "--- a/vendor/magento/module-present/a.php\n+++ b/vendor/magento/module-present/a.php\n@@ -1 +1,2 @@\n one\n+two\n" . $create($module, 'v1'))
+            ->write('vendor/acme/patches/s2.patch', "--- a/vendor/magento/module-present/b.php\n+++ b/vendor/magento/module-present/b.php\n@@ -1 +1,2 @@\n one\n+two\n" . $create($module, 'v2'))
+            ->write('vendor/magento/module-present/a.php', "one\n")
+            ->write('vendor/magento/module-present/b.php', "one\n");
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $module . ': the apply succeeds');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $module . ': and the next one');
+        Assert::same(
+            $installed ? "v2\n" : '',
+            (string) @file_get_contents($p->root . "/vendor/magento/$module/New.php"),
+            $module . ($installed ? ': the later version is there' : ': nothing is written into it')
+        );
+    }
+
+    Assert::case('an untrusted map cannot reach into another package under vendor/');
+    $untrusted = static function (string $name, ?array $map, string $decoy = "one\n") use ($sandbox, $meta): Project {
+        $p = (new Project($sandbox, $name))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/module-present', [])
+            ->package('acme/patches', $meta(['lines' => ['L' => [
+                'base' => ['acme/patches' => '*'],
+                'cumulative' => true,
+                'patches' => [['id' => 'M-1', 'source' => 'm1.patch'], ['id' => 'M-2', 'source' => 'm2.patch']],
+            ]]]))
+            ->write('vendor/acme/patches/m1.patch', "--- a/vendor/magento/module-absent/Missing.php\n+++ b/vendor/magento/module-absent/Missing.php\n@@ -1 +1,2 @@\n one\n+two\n--- a/vendor/magento/module-present/a.php\n+++ b/vendor/magento/module-present/a.php\n@@ -1 +1,2 @@\n one\n+two\n")
+            ->write('vendor/acme/patches/m2.patch', "--- a/vendor/magento/module-present/b.php\n+++ b/vendor/magento/module-present/b.php\n@@ -1 +1,2 @@\n one\n+two\n")
+            ->write('vendor/magento/module-present/a.php', "one\n")
+            ->write('vendor/magento/module-present/b.php', "one\n");
+
+        return $map === null ? $p : $p->package('zzz/widget', ['map' => $map], [], 'magento2-component')->write('vendor/zzz/widget/decoy.php', $decoy);
+    };
+    Assert::same(Renderer::OK, Renderer::exitCode($untrusted('untrusted-none', null)->patcher()->run(true)), 'control: no other package, both months apply');
+    $p = $untrusted('untrusted-absent', [['decoy.php', 'vendor/magento/module-absent/Missing.php']]);
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'a map onto a module file the store lacks changes nothing');
+    Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/vendor/magento/module-present/b.php'), 'and the chain applies');
+    $p = $untrusted('untrusted-diverged', [['decoy.php', 'vendor/magento/module-present/a.php']], "zzz\n");
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), 'a diverged decoy mapped onto a module file blocks nothing');
+    Assert::same("zzz\n", (string) file_get_contents($p->root . '/vendor/zzz/widget/decoy.php'), 'and is not written');
+
+    foreach (['no other package' => false, 'an untrusted map onto the vendor path' => true] as $how => $evil) {
+        // magento2-base from a path repository: the install path is the link's target.
+        $target = 'vendor/magento/magento2-base/nginx.conf.sample';
+        $p = (new Project($sandbox, 'path-repo-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->write('packages/base/nginx.conf.sample', "1\n2\n3\n")
+            ->write('nginx.conf.sample', "1\n2\n3\n")
+            ->write('own.patch', "--- a/$target\n+++ b/$target\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n");
+        mkdir($p->root . '/vendor/magento', 0777, true);
+        symlink('../../packages/base', $p->root . '/vendor/magento/magento2-base');
+        $p->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component');
+        if ($evil) {
+            $p->package('zzz/widget', ['map' => [['decoy', 'vendor/magento/magento2-base/nginx.conf.sample']]], [], 'magento2-component')
+                ->write('vendor/zzz/widget/decoy', "1\n2\n3\n");
+        }
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': applies');
+        Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/nginx.conf.sample'), $how . ': the served copy is patched');
+        Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/packages/base/nginx.conf.sample'), $how . ': and the package copy');
+    }
+
+    Assert::case('a map with a control character in it is not a mapping');
+    // A newline in a path would be written into a diff header unquoted.
+    $p = (new Project($sandbox, 'map-newline'))->write("vendor/x/y/odd\nname", "1\n")->write('vendor/x/y/plain', "1\n");
+    $resolver = new TargetResolver($p->root, [['package' => 'x/y', 'install' => 'vendor/x/y', 'map' => [
+        ["odd\nname", 'served-odd', false],
+        ['plain', "served\nplain", false],
+        ['plain', 'served-plain', false],
+    ]]]);
+    Assert::same(null, $resolver->mirrorFor('served-odd'), 'not from a source with a newline');
+    Assert::same(null, $resolver->mirrorFor("served\nplain"), 'nor to a destination with one');
+    Assert::same('vendor/x/y/plain', $resolver->mirrorFor('served-plain'), 'control: a plain mapping still is one');
+
+    Assert::case('a mode change reaches the other copy of a root file');
+    $modeStore = static function (string $name, string $patch, string $packageCopy) use ($sandbox, $meta): Project {
+        $p = (new Project($sandbox, $name))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/magento2-base', ['map' => [['bin/magento', 'bin/magento']]], [], 'magento2-component')
+            ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]))
+            ->write('vendor/acme/patches/p.patch', $patch)
+            ->write('vendor/magento/magento2-base/bin/magento', $packageCopy)
+            ->write('bin/magento', "1\n2\n3\n");
+        chmod($p->root . '/vendor/magento/magento2-base/bin/magento', 0644);
+        chmod($p->root . '/bin/magento', 0644);
+
+        return $p;
+    };
+    $permissions = static function (Project $p, string $path): string {
+        clearstatcache();
+
+        return sprintf('%o', fileperms($p->root . '/' . $path) & 0777);
+    };
+    $modeOnly = "diff --git a/bin/magento b/bin/magento\nold mode 100644\nnew mode 100755\n";
+    $modeAndContent = $modeOnly . "--- a/bin/magento\n+++ b/bin/magento\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n";
+    foreach (['mode only, copies in step' => [$modeOnly, "1\n2\n3\n"], 'mode and content, copies in step' => [$modeAndContent, "1\n2\n3\n"], 'control: diverged copies' => [$modeAndContent, "1\n2\n3\n# own\n"]] as $how => [$patch, $packageCopy]) {
+        $p = $modeStore('mode-' . md5($how), $patch, $packageCopy);
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': applies');
+        Assert::same(['755', '755'], [$permissions($p, 'bin/magento'), $permissions($p, 'vendor/magento/magento2-base/bin/magento')], $how . ': both copies executable');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), $how . ': and verify agrees');
+    }
+
+    Assert::case('a skipped mode change that is not there is skipped, not unwanted');
+    $p = (new Project($sandbox, 'skip-mode-absent'))
+        ->root($meta(['trust' => ['acme/*'], 'sources' => ['acme/patches' => ['skip' => ['M-1' => 'no']]]]))
+        ->package('acme/patches', $meta(['patches' => [['id' => 'M-1', 'source' => 'm.patch']]]))
+        ->write('vendor/acme/patches/m.patch', "diff --git a/bin/run b/bin/run\nold mode 100644\nnew mode 100755\n")
+        ->write('bin/run', "a\n");
+    chmod($p->root . '/bin/run', 0644);
+    Assert::same(Fragment::SKIPPED, $p->patcher()->run(false)[0]['fragments'][0]->verdict(), 'status says it is not there');
+    Assert::same(Fragment::SKIPPED, $p->patcher()->run(true)[0]['fragments'][0]->verdict(), 'and apply has nothing to take off');
+    chmod($p->root . '/bin/run', 0755);
+    Assert::same(Fragment::UNWANTED, $p->patcher()->run(false)[0]['fragments'][0]->verdict(), 'control: with the mode there, it is still present');
+
+    Assert::case('a diverged other copy reached through a symlinked directory');
+    $vendorProcessor = 'vendor/magento/magento2-base/pub/errors/processor.php';
+    // A hunk at line 1 with no trailing context has to match the whole file,
+    // so this one carries a line after the change.
+    foreach (['in step' => "<?php\n\$a = 1;\n\$b = 1;\n", 'diverged' => "<?php\n\$a = 1;\n\$b = 1;\n// ours\n"] as $how => $served) {
+        $p = (new Project($sandbox, 'through-link-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->package('magento/magento2-base', ['map' => [['pub/errors', 'pub/errors']]], [], 'magento2-component')
+            ->write($vendorProcessor, "<?php\n\$a = 1;\n\$b = 1;\n")
+            ->write('docroot/errors/processor.php', $served)
+            ->write('own.patch', "--- a/$vendorProcessor\n+++ b/$vendorProcessor\n@@ -1,3 +1,3 @@\n <?php\n-\$a = 1;\n+\$a = 2;\n \$b = 1;\n");
+        mkdir($p->root . '/pub');
+        symlink('../docroot/errors', $p->root . '/pub/errors');
+        Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(true)), $how . ': applies');
+        Assert::contains((string) file_get_contents($p->root . '/docroot/errors/processor.php'), '$a = 2;', $how . ': to the served copy');
+    }
+},
+
+'other-copy-missing' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+    foreach (['root path' => 'nginx.conf.sample', 'vendor path' => 'vendor/magento/magento2-base/nginx.conf.sample'] as $how => $target) {
+        Assert::case('served root file missing, patch names the ' . $how);
+        $p = (new Project($sandbox, 'miss-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component')
+            ->write('vendor/magento/magento2-base/nginx.conf.sample', "1\n2\n3\n")
+            ->write('own.patch', "--- a/$target\n+++ b/$target\n@@ -1,3 +1,3 @@\n 1\n-2\n+2a\n 3\n");
+        $patcher = $p->patcher();
+        $r = $patcher->run(true);
+        Assert::same(Renderer::OK, Renderer::exitCode($r), $how . ': applies');
+        Assert::same("1\n2a\n3\n", (string) file_get_contents($p->root . '/vendor/magento/magento2-base/nginx.conf.sample'), $how . ': package copy patched');
+        Assert::contains(implode("\n", array_column($patcher->advisories(), 'message')), 'composer reinstall magento/magento2-base', $how . ': warns that the served copy is missing');
+    }
+},
+
 'require-against' => static function (Sandbox $sandbox): void {
     $meta = static function (array $extra): array {
         return ['magento-patches' => $extra];
@@ -1858,6 +2985,56 @@ return [
         $sec = null;
         foreach ($r as $x) { if ($x['id'] === 'SEC-1') { $sec = $x; } }
         Assert::same("one\ntwo\n", (string) file_get_contents($p->root . '/a.txt'), $how . ': SEC-1 applied; errors=' . implode(' / ', $patcher->errors()) . ' reason=' . (string) ($sec['reason'] ?? ''));
+    }
+},
+
+'vendor-namespace' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+    Assert::case('an untrusted map onto a whole vendor namespace directory');
+    foreach (['control: no map' => null, 'map dest vendor/magento (dir)' => [['stuff', 'vendor/magento']]] as $how => $map) {
+      foreach ([false, true] as $withBase) {
+        $how2 = $how . ($withBase ? ' +magento2-base' : '');
+        $p = (new Project($sandbox, 'vdir-' . md5($how2)))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/module-catalog', [], [], 'magento2-module')
+            ->package('acme/patches', $meta(['patches' => [['id' => 'SEC-1', 'source' => 's.patch', 'base' => ['acme/patches' => '*']]]]))
+            ->write('vendor/acme/patches/s.patch', "--- a/vendor/magento/module-catalog/a.php\n+++ b/vendor/magento/module-catalog/a.php\n@@ -1 +1,2 @@\n one\n+two\n")
+            ->write('vendor/magento/module-catalog/a.php', "one\n");
+        if ($withBase) {
+            $p->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]], [], 'magento2-component')
+                ->write('vendor/magento/magento2-base/nginx.conf.sample', "x\n");
+        }
+        if ($map !== null) {
+            $p->package('zzz/widget', ['map' => $map], [], 'magento2-component')
+                ->write('vendor/zzz/widget/stuff/module-catalog/a.php', "diverged\n");
+        }
+        $r = $p->patcher()->run(true);
+        $o = [];
+        foreach ($r as $x) { foreach ($x['fragments'] as $f) { $o[] = $f->verdict() . ' ' . $f->reason(); } }
+        Assert::same(Renderer::OK, Renderer::exitCode($r), $how2 . ': the trusted patch applies ' . implode(' | ', $o));
+      }
+    }
+},
+
+'mode-only' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+    Assert::case('content in place, mode not (a copy deploy drops the executable bit)');
+    $diff = "diff --git a/bin/tool b/bin/tool\nold mode 100644\nnew mode 100755\n--- a/bin/tool\n+++ b/bin/tool\n@@ -1 +1,2 @@\n one\n+two\n";
+    foreach (['control: neither in place' => "one\n", 'content in place, mode not' => "one\ntwo\n"] as $how => $contents) {
+        $p = (new Project($sandbox, 'mode-' . md5($how)))
+            ->root($meta(['patches' => [['id' => 'OWN-1', 'source' => 'own.patch']]]))
+            ->write('own.patch', $diff)->write('bin/tool', $contents);
+        chmod($p->root . '/bin/tool', 0644);
+        $r = $p->patcher()->run(true);
+        $o = [];
+        foreach ($r as $x) { foreach ($x['fragments'] as $f) { $o[] = $f->verdict() . ' ' . $f->reason(); } }
+        Assert::same(Renderer::OK, Renderer::exitCode($r), $how . ': apply ends OK ' . implode(' | ', $o));
+        clearstatcache();
+        Assert::same(0755, fileperms($p->root . '/bin/tool') & 0777, $how . ': executable');
     }
 },
 

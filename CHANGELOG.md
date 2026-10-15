@@ -23,10 +23,21 @@ here into the GitHub release body. See `docs/releasing.md`.
   apply after those of the packages it requires.
 - **Security.** A `depends` naming nothing was ignored. It is now refused, with
   everything built on it, as is every patch in a dependency cycle.
+- **Security.** A patch failing partway left what it had written. Every write is
+  journalled and a failure puts it all back. Taking a skipped patch off too.
+- **Security.** A patch that sets a file mode read as applied once the content
+  was there. The mode is now set.
+- **Security.** A root file missing from the project root blocked its patch and
+  everything built on it. The package copy is patched instead, with a warning.
 - **Security.** `composer -d <dir> dump-autoload` skipped healing. It now heals
   however the command is run.
+- **Security.** Any package's `extra.map` counted as a root file's deploy
+  mapping, so a library could leave the served file unpatched. Only what
+  `magento-composer-installer` deploys counts now.
 - **Security.** A root file's other copy could get different code from the
   served one. Only a patch's file headers are retargeted now.
+- Other copies are found through symlinked packages, deletions reach both
+  copies, and nothing is created in a module the store does not install.
 - `status --json` reports the exit code the command exits with.
 
 ### Added

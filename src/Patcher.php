@@ -65,6 +65,9 @@ class Patcher
     /** @var bool */
     private $applying = false;
 
+    /** @var array<string, array<string, true>> deploying package => root files it ships that are missing */
+    private $missingRoots = [];
+
     /** @var array<int, array<string, mixed>>|null in apply order, with the order requires() implies */
     private $declarations;
 
@@ -73,6 +76,14 @@ class Patcher
 
     /** @var string[] the same, between two trusted packages, where it is only a warning */
     private $unorderedWarnings = [];
+
+    /**
+     * What the patch being written found at each path before it first wrote
+     * there, keyed by absolute path, so a failure can put every one of them back.
+     *
+     * @var array<string, array{fragment: Fragment, existed: bool, contents: string|false, mode: int, dirs: string[]}>
+     */
+    private $journal = [];
 
     public function __construct(Composer $composer, ProcessExecutor $process)
     {
@@ -85,10 +96,15 @@ class Patcher
         // the docroot is a symlink the two never share a prefix, and every
         // root-file mapping is silently dropped — which is exactly the
         // half-patched state this plugin exists to prevent.
-        $projectRoot = dirname((string) $composer->getConfig()->get('vendor-dir'));
+        $vendorDir = (string) $composer->getConfig()->get('vendor-dir');
+        $projectRoot = dirname($vendorDir);
         $projectRoot = realpath($projectRoot) ?: $projectRoot;
         $this->applier = new Applier($process, $projectRoot);
-        $this->resolver = new TargetResolver($projectRoot, $this->rootMappings($projectRoot));
+        $this->resolver = new TargetResolver(
+            $projectRoot,
+            $this->rootMappings($projectRoot, dirname($vendorDir)),
+            basename($vendorDir)
+        );
         $this->state = new State($projectRoot);
 
         $this->indexPackages();
@@ -150,7 +166,7 @@ class Patcher
             // A patch the store skips is reported as skipped, as status does,
             // whatever else is wrong with it.
             if ($mismatch === null && ($declaration['skipped'] ?? null) === null) {
-                $mismatch = $this->unplaced($declaration, $unordered);
+                $mismatch = $this->unplaced($declaration, $unordered) ?? $this->contested($declaration);
 
                 foreach ($declaration['depends'] as $needs) {
                     if ($mismatch === null && isset($refused[$needs])) {
@@ -236,6 +252,26 @@ class Patcher
         $lifecycle = (new Lifecycle())->advisory($this->installed);
         if ($lifecycle !== null) {
             $notices[] = $lifecycle;
+        }
+
+        // Patched in the package copy instead, so nothing failed. But the store
+        // is serving without them until they are deployed again.
+        foreach ($this->missingRoots as $package => $paths) {
+            $paths = array_keys($paths);
+            sort($paths);
+            $many = count($paths) > 1;
+            $notices[] = ['level' => 'warning', 'message' => sprintf(
+                '%d root file%s that %s deploys %s missing, %s. Patches to %s went to its copy in vendor/, '
+                . 'which the next deploy serves from. Put %s back with: composer reinstall %s',
+                count($paths),
+                $many ? 's' : '',
+                $package,
+                $many ? 'are' : 'is',
+                $many ? 'including ' . $paths[0] : $paths[0],
+                $many ? 'them' : 'it',
+                $many ? 'them' : 'it',
+                $package
+            )];
         }
 
         $stale = [];
@@ -373,7 +409,7 @@ class Patcher
             // A bad `depends` is still a configuration error, from the Collector.
             $unplacedBecause = $this->baseMismatch($declaration['base']) !== null
                 ? null
-                : $this->unplaced($declaration, $unordered);
+                : $this->unplaced($declaration, $unordered) ?? $this->contested($declaration);
 
             if ($unplacedBecause !== null) {
                 $results[] = array_merge($declaration, [
@@ -468,27 +504,45 @@ class Patcher
     private function unwanted(array $declaration, bool $apply, int $index): array
     {
         $fragments = $this->fragments($declaration);
-        $removed = false;
+        $removed = $failed = false;
+        $vacated = [];
+        $this->journal = [];
 
         foreach ($fragments as $fragment) {
+            // Nothing of the patch can be in a module the store does not
+            // install, and reversing a deletion there would write the file.
+            $absent = $this->notHere($fragment);
+
+            if ($absent !== null) {
+                $fragment->resolve(Fragment::SKIPPED, $absent);
+                continue;
+            }
+
             $target = $fragment->target();
             $primary = $this->resolver->writePathFor($target);
             $diff = $primary === $target
                 ? $fragment->diff()
                 : $this->applier->retarget($fragment->diff(), $target, $primary);
 
-            $mirror = $this->resolver->mirrorFor($target);
-            $mirrorDiff = $mirror === null
+            $mirror = $this->mirrorOf($target, $primary);
+            $mirrorPath = $mirror === null ? null : $this->resolver->writePathFor($mirror);
+            $mirrorDiff = $mirrorPath === null
                 ? null
-                : $this->applier->retarget($fragment->diff(), $target, $mirror);
+                : $this->applier->retarget($fragment->diff(), $target, $mirrorPath);
+
+            // A reverse check of a mode change alone passes whatever the mode,
+            // so for one of those the mode is what says it is there.
+            $modeOnly = $fragment->newMode() !== null && !$fragment->changesContent();
 
             // The mirror is checked even when the vendor copy is clean. A
             // magento2-base deploy leaves the patch in the served copy and not
             // the package one, and looking only at the primary calls that
             // "already gone".
-            $here = $this->applier->isAppliedBeneath($diff, $primary, $this->above($index, $target, $primary));
-            $there = $mirror !== null && $mirrorDiff !== null
-                && $this->applier->isAppliedBeneath($mirrorDiff, $mirror, $this->above($index, $target, $mirror));
+            $here = $this->applier->isAppliedBeneath($diff, $primary, $this->above($index, $target, $primary))
+                && (!$modeOnly || $this->hasMode($fragment, $primary));
+            $there = $mirrorPath !== null && $mirrorDiff !== null
+                && $this->applier->isAppliedBeneath($mirrorDiff, $mirrorPath, $this->above($index, $target, $mirrorPath))
+                && (!$modeOnly || $this->hasMode($fragment, $mirrorPath));
 
             if (!$here && !$there) {
                 // Absent is only one of the reasons a reverse-check fails. The
@@ -504,10 +558,29 @@ class Patcher
                         Fragment::CONFLICT,
                         'cannot tell whether it is applied: ' . $this->applier->lastError()
                     );
+                    $failed = true;
                     continue;
                 }
 
                 $fragment->resolve(Fragment::SKIPPED);
+                continue;
+            }
+
+            // Two packages ship the file, so there is no one other copy to
+            // take it off as well, and the next deploy could put it back.
+            $contest = $this->resolver->contested($target);
+
+            if ($contest !== null) {
+                $fragment->resolve(Fragment::CONFLICT, 'not taken off: ' . $contest);
+                $failed = true;
+                continue;
+            }
+
+            $unrenamable = $this->unrenamable($fragment, $primary, $mirror);
+
+            if ($unrenamable !== null) {
+                $fragment->resolve(Fragment::CONFLICT, $unrenamable);
+                $failed = true;
                 continue;
             }
 
@@ -516,20 +589,30 @@ class Patcher
                 continue;
             }
 
-            if ($here && !$this->applier->revert($diff)) {
-                $fragment->resolve(Fragment::CONFLICT, $this->applier->lastError());
-                continue;
-            }
-
             if ($here) {
+                $this->remember($primary, $fragment);
+
+                if ($fragment->renamedFrom() !== null) {
+                    $this->remember((string) $fragment->renamedFrom(), $fragment);
+                }
+
+                if (!$this->applier->revert($diff)) {
+                    $fragment->resolve(Fragment::CONFLICT, $this->applier->lastError());
+                    $failed = true;
+                    continue;
+                }
+
                 $fragment->recordWrite($primary);
             }
 
             // The other copy of a root-mapped file has to come off too, or the
             // next deploy copies the patch straight back over the first.
             if ($there) {
+                $this->remember((string) $mirrorPath, $fragment);
+
                 if (!$this->applier->revert((string) $mirrorDiff)) {
                     $fragment->resolve(Fragment::MIRROR_CONFLICT, $this->applier->lastError());
+                    $failed = true;
                     continue;
                 }
 
@@ -544,13 +627,24 @@ class Patcher
             // modification hunk is otherwise read as "this module does not ship
             // this file" — a NOT_APPLICABLE that exits 0 under a green banner.
             if ($fragment->createsFile()) {
-                $this->vacated[$primary] = (string) $declaration['label'];
+                $vacated[$primary] = (string) $declaration['label'];
 
                 if ($mirror !== null) {
-                    $this->vacated[$mirror] = (string) $declaration['label'];
+                    $vacated[$mirror] = (string) $declaration['label'];
                 }
             }
         }
+
+        // Off whole or not at all, as a patch goes on: half a security patch
+        // is neither what the store asked for nor what it had.
+        if ($failed) {
+            $this->rollback($declaration, Fragment::UNWANTED, 'another file in "%s" would not come off');
+
+            return $fragments;
+        }
+
+        $this->journal = [];
+        $this->vacated = array_merge($this->vacated, $vacated);
 
         if ($removed) {
             $this->state->forget($declaration['owner'] . ' ' . $declaration['label']);
@@ -664,7 +758,11 @@ class Patcher
             }
 
             foreach ($this->fragments($declaration) as $fragment) {
-                if ($fragment->createsFile()) {
+                // A creation in a module this store does not install never
+                // lands, so it supersedes nothing: counted, it flipped the
+                // earlier creators to "the patch that replaces this one did not
+                // apply", failing every apply while verify said 0.
+                if ($fragment->createsFile() && $this->notHere($fragment) === null) {
                     // Keyed by owner as well as target. Adobe regenerates
                     // vendor/bin/patch-status every month, so month two's
                     // new-file hunk supersedes month one's — within the package
@@ -702,6 +800,47 @@ class Patcher
         }
 
         return $unordered[$declaration['origin']] ?? null;
+    }
+
+    /**
+     * Why this patch cannot be written to the store at all, or null: it
+     * changes a root file two packages deploy, so which copy is served, and
+     * so which is the other copy to keep in step, is down to their deploy
+     * order. Patching one would report the file fixed while the copy that is
+     * served, or the one the next deploy restores, is not.
+     *
+     * @param array<string, mixed> $declaration
+     */
+    private function contested(array $declaration): ?string
+    {
+        if ($this->baseMismatch($declaration['base']) !== null) {
+            return null;
+        }
+
+        foreach ($this->fragments($declaration) as $fragment) {
+            $why = $this->resolver->contested($fragment->target());
+
+            if ($why === null) {
+                continue;
+            }
+
+            $error = sprintf(
+                '%s: patch "%s" changes %s, but %s, so which copy is served depends on their deploy order. '
+                    . 'Remove one, or exclude its copy with extra.magento-deploy-ignore',
+                $declaration['owner'],
+                $declaration['label'],
+                $fragment->target(),
+                $why
+            );
+
+            if (!in_array($error, $this->errors, true)) {
+                $this->errors[] = $error;
+            }
+
+            return $why;
+        }
+
+        return null;
     }
 
     /**
@@ -1163,9 +1302,7 @@ class Patcher
     /** Root copy and package copy of a root-mapped file are one file, whichever a hunk names. */
     private function fileKey(string $target): string
     {
-        $mirror = $this->resolver->mirrorFor($target);
-
-        return $mirror === null || strcmp($target, $mirror) < 0 ? $target : $mirror;
+        return $this->resolver->rootOf($target) ?? $target;
     }
 
     /**
@@ -1284,6 +1421,8 @@ class Patcher
             return $result;
         }
 
+        $this->journal = [];
+
         foreach ($fragments as $position => $fragment) {
             $this->handle($fragment, $apply, $declaration['owner'], $superseded[$position], $index);
             $result['fragments'][] = $fragment;
@@ -1291,11 +1430,13 @@ class Patcher
             // Pre-flight said every fragment would apply, so a failure here is
             // the working tree changing underneath us, or a permission problem.
             // Rare, but it is exactly the half-applied state the pre-flight
-            // exists to prevent, so undo what already landed.
+            // exists to prevent, so undo what already landed. Nothing is
+            // recorded: a rolled-back write on record would later pass for a
+            // file this plugin wrote, and be replaced as one.
             if ($apply && $fragment->isFailure()) {
-                $this->rollback($result['fragments'], $declaration);
+                $this->rollback($declaration);
 
-                break;
+                return $result;
             }
         }
 
@@ -1334,44 +1475,133 @@ class Patcher
     }
 
     /**
-     * Undo the fragments of this patch that did land, after a later one failed.
+     * Keep what is at $path before this patch first writes it.
+     */
+    private function remember(string $path, Fragment $fragment): void
+    {
+        $absolute = $this->resolver->absolute($path);
+
+        if (isset($this->journal[$absolute])) {
+            return;
+        }
+
+        clearstatcache(true, $absolute);
+        $existed = is_file($absolute);
+        $dirs = [];
+
+        // The directories a new file will need, deepest first, so they can go too.
+        for ($dir = dirname($absolute); !$existed && !is_dir($dir) && $dir !== dirname($dir); $dir = dirname($dir)) {
+            $dirs[] = $dir;
+        }
+
+        $this->journal[$absolute] = [
+            'fragment' => $fragment,
+            'existed' => $existed,
+            'contents' => $existed ? @file_get_contents($absolute) : false,
+            'mode' => $existed ? (int) fileperms($absolute) & 07777 : 0,
+            'dirs' => $dirs,
+        ];
+    }
+
+    /**
+     * Put back everything this patch wrote, after a later file failed.
      *
-     * @param Fragment[] $fragments
+     * Driven by what was written, not by verdicts. A fragment that wrote its
+     * primary and then failed on the mirror reads as a failure, and its primary
+     * still has to come back; so does a mirror, a superseded file and a deleted
+     * one, none of which reversing the primary's diff ever reached. Restoring
+     * the bytes rather than reversing the diff also restores the mode, which
+     * git apply resets on every file it writes.
+     *
      * @param array<string, mixed> $declaration
      */
-    private function rollback(array $fragments, array $declaration): void
-    {
-        foreach ($fragments as $fragment) {
-            if ($fragment->verdict() !== Fragment::APPLIED) {
-                continue;
-            }
+    private function rollback(
+        array $declaration,
+        string $verdict = Fragment::APPLICABLE,
+        string $why = 'another file in "%s" would not take the patch'
+    ): void {
+        $stuck = [];
 
-            $target = $fragment->target();
-            $primary = $this->resolver->writePathFor($target);
-            $diff = $primary === $target
-                ? $fragment->diff()
-                : $this->applier->retarget($fragment->diff(), $target, $primary);
+        foreach (array_reverse($this->journal, true) as $absolute => $before) {
+            $fragment = $before['fragment'];
 
-            if ($this->applier->revert($diff)) {
-                $fragment->resolve(Fragment::APPLICABLE, sprintf(
-                    'rolled back: another file in "%s" would not take the patch',
-                    $declaration['label']
+            if (!$this->restore($absolute, $before)) {
+                $stuck[spl_object_id($fragment)] = true;
+                $fragment->resolve(Fragment::CONFLICT, sprintf(
+                    '"%s" failed on a later file, and %s could not be put back as it was',
+                    $declaration['label'],
+                    substr($absolute, strlen($this->resolver->absolute('')))
                 ));
 
                 continue;
             }
 
-            $fragment->resolve(Fragment::CONFLICT, sprintf(
-                'applied, but "%s" failed on a later file and this could not be rolled back',
-                $declaration['label']
-            ));
+            if (!$fragment->isFailure()) {
+                $fragment->resolve($verdict, 'rolled back: ' . sprintf($why, $declaration['label']));
+            }
         }
+
+        // What was put back is no longer written, and --json must not list it.
+        foreach ($this->journal as $before) {
+            if (!isset($stuck[spl_object_id($before['fragment'])])) {
+                $before['fragment']->forgetWrites();
+            }
+        }
+
+        $this->journal = [];
+    }
+
+    /**
+     * @param array{fragment: Fragment, existed: bool, contents: string|false, mode: int, dirs: string[]} $before
+     */
+    private function restore(string $absolute, array $before): bool
+    {
+        clearstatcache(true, $absolute);
+
+        if (!$before['existed']) {
+            if ((file_exists($absolute) || is_link($absolute)) && !@unlink($absolute)) {
+                return false;
+            }
+
+            foreach ($before['dirs'] as $dir) {
+                @rmdir($dir);
+            }
+
+            return true;
+        }
+
+        if ($before['contents'] === false) {
+            return false;
+        }
+
+        if (is_file($absolute)
+            && (fileperms($absolute) & 07777) === $before['mode']
+            && @file_get_contents($absolute) === $before['contents']
+        ) {
+            return true;
+        }
+
+        $dir = dirname($absolute);
+
+        return (is_dir($dir) || @mkdir($dir, 0777, true) || is_dir($dir))
+            && @file_put_contents($absolute, $before['contents']) === strlen($before['contents'])
+            && @chmod($absolute, $before['mode']);
     }
 
     private function handle(Fragment $fragment, bool $apply, string $owner, bool $superseded, int $index): void
     {
         if ($superseded) {
             $fragment->resolve(Fragment::NOT_APPLICABLE, 'superseded by a later patch in this line');
+
+            return;
+        }
+
+        // A modification finds nothing to patch there anyway; a new file would
+        // be written into a module the store does not have.
+        $absent = $fragment->createsFile() ? $this->notHere($fragment) : null;
+
+        if ($absent !== null) {
+            $fragment->resolve(Fragment::NOT_APPLICABLE, $absent);
 
             return;
         }
@@ -1383,9 +1613,44 @@ class Patcher
         $primary = $this->resolver->writePathFor($target);
         $diff = $primary === $target ? $fragment->diff() : $this->applier->retarget($fragment->diff(), $target, $primary);
 
-        $mirror = $this->resolver->mirrorFor($target);
+        $mirror = $this->mirrorOf($target, $primary);
+
+        // One copy gone and the other there: patch the one that is. A failed
+        // update can leave a root file undeployed, and refusing the patch
+        // blocked every month built on it, while the package copy is what the
+        // next deploy serves from. The other way round, a package copy gone
+        // with the served one in place, is vulnerable code being served.
+        // A root file the store has the installer ignore is not missing.
+        if ($mirror !== null
+            && !$fragment->createsFile()
+            && !isset($this->vacated[$primary])
+            && !file_exists($this->resolver->absolute($primary))
+            && file_exists($this->resolver->absolute($mirror))
+        ) {
+            $rootMissing = $this->resolver->rootOf($target) === ltrim($target, '/');
+            $deployer = $rootMissing ? $this->resolver->deployedBy($target) : null;
+
+            if (!$rootMissing || $deployer !== null) {
+                if ($deployer !== null) {
+                    $this->missingRoots[$deployer][ltrim($target, '/')] = true;
+                }
+
+                $primary = $this->resolver->writePathFor($mirror);
+                $diff = $this->applier->retarget($fragment->diff(), $target, $primary);
+                $mirror = null;
+            }
+        }
+
         $linked = $mirror !== null && $this->resolver->isSameFile($primary, $mirror);
         $before = $this->resolver->hash($primary);
+
+        $unrenamable = $this->unrenamable($fragment, $primary, $mirror);
+
+        if ($unrenamable !== null) {
+            $fragment->resolve(Fragment::CONFLICT, $unrenamable);
+
+            return;
+        }
 
         // Reverse first, and it wins outright. A hunk whose context is ordinary
         // boilerplate can match at more than one offset — the July patch's
@@ -1394,8 +1659,43 @@ class Patcher
         // change. "Is it already there" is the question that decides.
         // Asked beneath later links in the chain, which may have rewritten its lines.
         if ($this->applier->isAppliedBeneath($diff, $primary, $this->above($index, $target, $primary))) {
-            $fragment->resolve(Fragment::ALREADY);
-            $this->reconcile($fragment, $primary, $mirror, $before, $linked, $apply, $index);
+            if ($this->hasMode($fragment, $primary)) {
+                $fragment->resolve(Fragment::ALREADY);
+                $this->reconcile($fragment, $primary, $mirror, $before, $linked, $apply, $index);
+
+                return;
+            }
+
+            // The content is there and only the mode is not: a copy deploy drops
+            // the executable bit. Neither direction of git apply can fix that,
+            // so set it, rather than calling the patch a conflict for good.
+            // chmod() follows a link, as copy() does, wherever it points.
+            if ($this->resolver->escapesProject($primary)) {
+                $fragment->resolve(Fragment::CONFLICT, $primary . ' resolves outside the project and was not written');
+
+                return;
+            }
+
+            if (!$apply) {
+                $fragment->resolve(Fragment::APPLICABLE, sprintf('%s does not have mode %o', $primary, (int) $fragment->newMode()));
+
+                // Whether the other copy can follow is part of whether this applies.
+                $this->reconcile($fragment, $primary, $mirror, $before, $linked, false, $index, true);
+
+                return;
+            }
+
+            $this->remember($primary, $fragment);
+
+            if (!@chmod($this->resolver->absolute($primary), (int) $fragment->newMode())) {
+                $fragment->resolve(Fragment::CONFLICT, sprintf('could not set mode %o on %s', (int) $fragment->newMode(), $primary));
+
+                return;
+            }
+
+            $fragment->resolve(Fragment::APPLIED);
+            $fragment->recordWrite($primary);
+            $this->reconcile($fragment, $primary, $mirror, $before, $linked, true, $index);
 
             return;
         }
@@ -1409,7 +1709,18 @@ class Patcher
             if (!$apply) {
                 $fragment->resolve(Fragment::APPLICABLE);
 
+                // The mirror is written in the same pass, so whether it can
+                // follow is part of whether this applies. Finding out after the
+                // primary is written is how a patch ends up half on disk.
+                $this->reconcile($fragment, $primary, $mirror, $before, $linked, false, $index, true);
+
                 return;
+            }
+
+            $this->remember($primary, $fragment);
+
+            if ($fragment->renamedFrom() !== null) {
+                $this->remember((string) $fragment->renamedFrom(), $fragment);
             }
 
             if (!$this->applier->apply($diff)) {
@@ -1425,7 +1736,9 @@ class Patcher
             // security fix is on disk, not whether a command was happy. So
             // check the bytes moved, and treat a silent no-op as a conflict
             // rather than the success it claimed to be.
-            if ($this->resolver->hash($primary) === $before) {
+            if ($this->resolver->hash($primary) === $before
+                && ($fragment->newMode() === null || !$this->hasMode($fragment, $primary))
+            ) {
                 $fragment->resolve(
                     Fragment::CONFLICT,
                     'git apply reported success but ' . $primary . ' did not change'
@@ -1471,6 +1784,7 @@ class Patcher
         if ($fragment->createsFile() && $current !== null && $this->state->wasWrittenBy($owner, $primary, $current)) {
             if (!$apply) {
                 $fragment->resolve(Fragment::APPLICABLE, 'supersedes an earlier patch in this chain');
+                $this->reconcile($fragment, $primary, $mirror, $before, $linked, false, $index, true);
 
                 return;
             }
@@ -1492,6 +1806,7 @@ class Patcher
             }
 
             $aside = $absolute . '.mpi-superseded-' . bin2hex(random_bytes(4));
+            $this->remember($primary, $fragment);
 
             if (@rename($absolute, $aside)) {
                 if ($this->applier->apply($diff)) {
@@ -1518,6 +1833,65 @@ class Patcher
     }
 
     /**
+     * Why a rename cannot be applied here, or null.
+     *
+     * git apply renames one path to another. A root file's other copy, or a
+     * path that resolves through a symlink, would need the old name mapped as
+     * well, and a rename half carried out loses the store's file. No Adobe
+     * patch renames a file, so these are refused rather than attempted.
+     */
+    private function unrenamable(Fragment $fragment, string $primary, ?string $mirror): ?string
+    {
+        $from = $fragment->renamedFrom();
+
+        if ($from === null
+            || ($mirror === null
+                && $primary === $fragment->target()
+                && $this->resolver->mirrorFor($from) === null
+                && $this->resolver->writePathFor($from) === $from)
+        ) {
+            return null;
+        }
+
+        return sprintf(
+            'renames %s, which has another copy or resolves through a symlink, so the rename cannot be kept in step',
+            $from
+        );
+    }
+
+    /**
+     * Does $path have the mode $fragment sets, if it sets one?
+     *
+     * git's reverse check of a mode change only warns when the mode differs,
+     * so on its own it reads a fragment that makes a file executable as
+     * already applied to one that is not.
+     */
+    private function hasMode(Fragment $fragment, string $path): bool
+    {
+        $mode = $fragment->newMode();
+        $absolute = $this->resolver->absolute($path);
+        clearstatcache(true, $absolute);
+
+        return $mode === null || !is_file($absolute) || (fileperms($absolute) & 0777) === $mode;
+    }
+
+    /**
+     * The other copy of $target, unless it is the file being written.
+     *
+     * The symlink deploy strategy leaves the served copy a link to the
+     * package's, so both paths name one file. Handled as two, a skipped patch
+     * was reverted twice, the second failed, and the rollback put it back on
+     * every run. A hardlink is still two paths to write, so this asks where
+     * each is written, not whether they are the same file.
+     */
+    private function mirrorOf(string $target, string $primary): ?string
+    {
+        $mirror = $this->resolver->mirrorFor($target);
+
+        return $mirror !== null && $this->resolver->writePathFor($mirror) === $primary ? null : $mirror;
+    }
+
+    /**
      * Bring the other copy of a root-mapped file into line.
      *
      * In lockstep — the copies matched before we touched anything — the patched
@@ -1531,6 +1905,9 @@ class Patcher
      * wiped by a magento2-base reinstall is exactly the drift this plugin exists
      * to report, and quietly healing it inside `magento-patches:verify` would return 0
      * for a store that is serving an unpatched file.
+     *
+     * $pending asks the same of a primary that is about to be written: could
+     * the mirror follow it?
      */
     private function reconcile(
         Fragment $fragment,
@@ -1539,7 +1916,8 @@ class Patcher
         ?string $before,
         bool $linked,
         bool $apply,
-        int $index
+        int $index,
+        bool $pending = false
     ): void {
         if ($mirror === null) {
             return;
@@ -1549,25 +1927,29 @@ class Patcher
         $primaryAbsolute = $this->resolver->absolute($primary);
 
         if (!file_exists($mirrorAbsolute) && !$fragment->createsFile()) {
+            // The served copy is the one gone, for a patch that names the
+            // package copy: warn as handle() does for one that names the root.
+            $deployer = $this->resolver->rootOf($mirror) === ltrim($mirror, '/')
+                ? $this->resolver->deployedBy($mirror)
+                : null;
+
+            if ($deployer !== null) {
+                $this->missingRoots[$deployer][ltrim($mirror, '/')] = true;
+            }
+
             return;
         }
 
         $mirrorHash = $this->resolver->hash($mirror);
         $primaryHash = $this->resolver->hash($primary);
 
-        if ($mirrorHash !== null && $mirrorHash === $primaryHash) {
+        if ($mirrorHash !== null && $mirrorHash === $primaryHash && !$pending && $this->hasMode($fragment, $mirror)) {
             return;
         }
 
         // Hardlinked copies were one file until `git apply` wrote and renamed;
         // they were in lockstep by definition, so copy.
         if ($linked || ($before !== null && $mirrorHash === $before)) {
-            if (!$apply) {
-                $fragment->resolve(Fragment::APPLICABLE, $mirror . ' is out of step and would be rewritten');
-
-                return;
-            }
-
             // Every other write goes through git apply, which refuses to write
             // beyond a symbolic link. copy() follows one happily, so this is
             // the one path a hostile extra.map could aim out of the project —
@@ -1583,9 +1965,25 @@ class Patcher
                 return;
             }
 
-            $mirrorWrite = $this->resolver->absolute($this->resolver->writePathFor($mirror));
+            if (!$apply) {
+                if (!$pending) {
+                    $fragment->resolve(Fragment::APPLICABLE, $mirror . ' is out of step and would be rewritten');
+                }
 
-            if (!@copy($primaryAbsolute, $mirrorWrite)) {
+                return;
+            }
+
+            $mirrorWrite = $this->resolver->writePathFor($mirror);
+            $this->remember($mirrorWrite, $fragment);
+
+            // A deletion leaves nothing to copy: the package copy goes too. A
+            // copy keeps the destination's mode, so a mode change is set too.
+            $written = file_exists($primaryAbsolute)
+                ? @copy($primaryAbsolute, $this->resolver->absolute($mirrorWrite))
+                    && ($fragment->newMode() === null || @chmod($this->resolver->absolute($mirrorWrite), (int) $fragment->newMode()))
+                : @unlink($this->resolver->absolute($mirrorWrite));
+
+            if (!$written) {
                 $fragment->resolve(Fragment::MIRROR_CONFLICT, 'could not write ' . $mirror);
 
                 return;
@@ -1596,23 +1994,59 @@ class Patcher
             return;
         }
 
-        $mirrorDiff = $this->applier->retarget($fragment->diff(), $fragment->target(), $mirror);
+        // Through any link in its path: git apply will not write beyond one.
+        $mirrorWrite = $this->resolver->writePathFor($mirror);
+        $mirrorDiff = $this->applier->retarget($fragment->diff(), $fragment->target(), $mirrorWrite);
 
-        $above = $this->above($index, $fragment->target(), $mirror);
-        if ($this->applier->isAppliedBeneath($mirrorDiff, $mirror, $above)) {
+        $above = $this->above($index, $fragment->target(), $mirrorWrite);
+        if ($this->applier->isAppliedBeneath($mirrorDiff, $mirrorWrite, $above)) {
+            if ($this->hasMode($fragment, $mirrorWrite)) {
+                return;
+            }
+
+            // The content is there and only the mode is not, as handle() finds
+            // on the served copy: set it, rather than a conflict for good.
+            if ($this->resolver->escapesProject($mirror)) {
+                $fragment->resolve(Fragment::MIRROR_CONFLICT, $mirror . ' resolves outside the project and was not written');
+
+                return;
+            }
+
+            if (!$apply) {
+                if (!$pending) {
+                    $fragment->resolve(Fragment::APPLICABLE, sprintf('%s does not have mode %o', $mirror, (int) $fragment->newMode()));
+                }
+
+                return;
+            }
+
+            $this->remember($mirrorWrite, $fragment);
+
+            if (!@chmod($this->resolver->absolute($mirrorWrite), (int) $fragment->newMode())) {
+                $fragment->resolve(Fragment::MIRROR_CONFLICT, sprintf('could not set mode %o on %s', (int) $fragment->newMode(), $mirror));
+
+                return;
+            }
+
+            $fragment->recordWrite($mirror);
+
             return;
         }
 
         $applicable = $this->applying
             ? $this->applier->canApply($mirrorDiff)
-            : $this->applier->canApplyAbove($mirrorDiff, $mirror, $this->below($index, $fragment->target(), $mirror));
+            : $this->applier->canApplyAbove($mirrorDiff, $mirrorWrite, $this->below($index, $fragment->target(), $mirrorWrite));
 
         if ($applicable) {
             if (!$apply) {
-                $fragment->resolve(Fragment::APPLICABLE, $mirror . ' is not patched');
+                if (!$pending) {
+                    $fragment->resolve(Fragment::APPLICABLE, $mirror . ' is not patched');
+                }
 
                 return;
             }
+
+            $this->remember($mirrorWrite, $fragment);
 
             if ($this->applier->apply($mirrorDiff)) {
                 $fragment->recordWrite($mirror);
@@ -1653,6 +2087,19 @@ class Patcher
         return null;
     }
 
+    /**
+     * Why nothing should be written for $fragment at all, or null: its target
+     * is in a package this store replaces, or does not install.
+     */
+    private function notHere(Fragment $fragment): ?string
+    {
+        $package = $fragment->owningPackage();
+
+        return $package !== null && (isset($this->replacedBy[$package]) || !isset($this->installed[$package]))
+            ? $this->whyMissing($fragment)
+            : null;
+    }
+
     private function whyMissing(Fragment $fragment): string
     {
         $package = $fragment->owningPackage();
@@ -1687,33 +2134,61 @@ class Patcher
     }
 
     /**
-     * Every installed package that deploys files to the project root.
+     * What magento/magento-composer-installer deploys to the project root, by
+     * package.
      *
-     * @return array<int, array{package: string, install: string, map: array<mixed>}>
+     * Only that may stand as a root file's other copy. An ordinary library's
+     * extra.map is read by nothing, yet it used to be taken at its word: one
+     * that sorted first could name its own decoy as the copy of a file
+     * magento2-base deploys, and the base copy went unpatched under a clean
+     * report. The installer deploys only the magento2-* types, and only a
+     * package with an extra.map of its own, which the root's
+     * magento-map-overwrite then replaces (Installer::supports(), install(),
+     * getParser()). Destinations are rooted, translated and ignored as it
+     * does (TargetResolver::deployed()).
+     *
+     * @return array<int, array{package: string, install: string, raw: string, map: array<mixed>}>
      */
-    private function rootMappings(string $projectRoot): array
+    private function rootMappings(string $projectRoot, string $unresolvedRoot): array
     {
         $mappings = [];
         $prefix = rtrim($projectRoot, '/') . '/';
+        $unresolvedPrefix = rtrim($unresolvedRoot, '/') . '/';
+        $root = $this->composer->getPackage()->getExtra();
+        $overwrite = is_array($root['magento-map-overwrite'] ?? null) ? array_change_key_case($root['magento-map-overwrite']) : [];
+        $ignore = is_array($root['magento-deploy-ignore'] ?? null) ? array_change_key_case($root['magento-deploy-ignore']) : [];
+        $translations = is_array($root['path-mapping-translations'] ?? null) ? $root['path-mapping-translations'] : [];
 
         foreach ($this->composer->getRepositoryManager()->getLocalRepository()->getPackages() as $package) {
             $extra = $package->getExtra();
+            $typePrefix = TargetResolver::DEPLOYED_TYPES[$package->getType()] ?? null;
+            $map = $overwrite[$package->getName()] ?? $extra['map'] ?? null;
 
-            if (!isset($extra['map']) || !is_array($extra['map'])) {
+            if ($typePrefix === null || !isset($extra['map']) || !is_array($map)) {
                 continue;
             }
 
-            $installPath = (string) $this->composer->getInstallationManager()->getInstallPath($package);
-            $installPath = realpath($installPath) ?: $installPath;
+            $rawPath = (string) $this->composer->getInstallationManager()->getInstallPath($package);
+            $installPath = realpath($rawPath) ?: $rawPath;
+            $raw = '';
+
+            foreach ([$prefix, $unresolvedPrefix] as $base) {
+                if ($raw === '' && strpos($rawPath, $base) === 0) {
+                    $raw = substr($rawPath, strlen($base));
+                }
+            }
 
             if (strpos($installPath, $prefix) !== 0) {
                 continue;
             }
 
+            $ignored = array_merge((array) ($ignore['*'] ?? []), (array) ($ignore[$package->getName()] ?? []));
+
             $mappings[] = [
                 'package' => $package->getName(),
                 'install' => substr($installPath, strlen($prefix)),
-                'map' => $extra['map'],
+                'raw' => $raw,
+                'map' => TargetResolver::deployed($map, $typePrefix, $translations, $ignored),
             ];
         }
 

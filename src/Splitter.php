@@ -41,6 +41,7 @@ class Splitter
         $target = null;
         $minusPath = null;
         $createsFile = false;
+        $renamedFrom = null;
         $sawHunk = false;
         $oldLeft = 0;
         $newLeft = 0;
@@ -80,13 +81,14 @@ class Splitter
 
             if ($opensGitHeader || $opensPlainHeader) {
                 if ($buffer !== [] && $target !== null && $target !== '') {
-                    $fragments[] = new Fragment($target, $buffer, $createsFile);
+                    $fragments[] = new Fragment($target, $buffer, $createsFile, $renamedFrom);
                 }
 
                 $buffer = [];
                 $target = null;
                 $minusPath = null;
                 $createsFile = false;
+                $renamedFrom = null;
                 $sawHunk = false;
             }
 
@@ -98,6 +100,10 @@ class Splitter
                 && preg_match('#^diff --git (?:"(?:\\\\.|[^"])*"|\S+) ("(?:\\\\.|[^"])*"|\S+)#', $line, $matches) === 1
             ) {
                 $target = $this->stripPrefix($this->unquote($matches[1]));
+            }
+
+            if (!$sawHunk && strpos($line, 'rename from ') === 0) {
+                $renamedFrom = $this->unquote(rtrim(substr($line, strlen('rename from ')), "\r"));
             }
 
             if (strpos($line, '--- ') === 0) {
@@ -131,7 +137,7 @@ class Splitter
         }
 
         if ($buffer !== [] && $target !== null && $target !== '') {
-            $fragments[] = new Fragment($target, $buffer, $createsFile);
+            $fragments[] = new Fragment($target, $buffer, $createsFile, $renamedFrom);
         }
 
         return $fragments;

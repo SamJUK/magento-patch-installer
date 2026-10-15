@@ -52,6 +52,9 @@ class Fragment
     /** @var bool True when the fragment creates the file (`--- /dev/null`). */
     private $createsFile;
 
+    /** @var string|null The path a rename takes the target from (`rename from`). */
+    private $renamedFrom;
+
     /** @var string */
     private $verdict = self::APPLICABLE;
 
@@ -64,11 +67,17 @@ class Fragment
     /**
      * @param string[] $lines
      */
-    public function __construct(string $target, array $lines, bool $createsFile)
+    public function __construct(string $target, array $lines, bool $createsFile, ?string $renamedFrom = null)
     {
         $this->target = $target;
         $this->lines = $lines;
         $this->createsFile = $createsFile;
+        $this->renamedFrom = $renamedFrom;
+    }
+
+    public function renamedFrom(): ?string
+    {
+        return $this->renamedFrom;
     }
 
     public function target(): string
@@ -79,6 +88,39 @@ class Fragment
     public function createsFile(): bool
     {
         return $this->createsFile;
+    }
+
+    /**
+     * The mode a `new mode` line sets, or null. A new file's mode is not one:
+     * creating the file sets it.
+     */
+    public function newMode(): ?int
+    {
+        foreach ($this->lines as $line) {
+            if (strpos($line, '@@') === 0) {
+                break;
+            }
+
+            if (preg_match('/^new mode ([0-7]+)/', $line, $m) === 1) {
+                return (int) octdec($m[1]) & 0777;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether it has a hunk, rather than only a mode change.
+     */
+    public function changesContent(): bool
+    {
+        foreach ($this->lines as $line) {
+            if (strpos($line, '@@') === 0) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public function diff(): string
@@ -125,6 +167,11 @@ class Fragment
     public function recordWrite(string $path): void
     {
         $this->written[] = $path;
+    }
+
+    public function forgetWrites(): void
+    {
+        $this->written = [];
     }
 
     public function wasWritten(): bool
