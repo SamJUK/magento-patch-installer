@@ -182,15 +182,9 @@ return [
         . "@@ -1 +1,2 @@\n one\n+two\n"
     );
     Assert::same('some dir/a file.txt', $fragments[0]->target(), 'surrounding quotes stripped');
-    // The diff text has to agree with the target, or retarget() — which is how
-    // the mirrored copy of a root-mapped file is patched — matches nothing and
-    // silently reports that copy as in step.
-    Assert::contains($fragments[0]->diff(), '--- a/some dir/a file.txt', 'and the header is rewritten to match');
-    Assert::contains($fragments[0]->diff(), '+++ b/some dir/a file.txt', 'both sides of the pair');
-    // The `diff --git` line keeps its quotes: git reads the paths from the
-    // header pair when there is one, and rewriting it would need the escaping
-    // logic back again for no gain.
-    Assert::contains($fragments[0]->diff(), 'diff --git "a/some dir', 'the diff --git line is left as it was');
+    // The diff text is git's own, quotes and all; retarget() reads them.
+    Assert::contains($fragments[0]->diff(), '--- "a/some dir/a file.txt"', 'the header pair is left as it was');
+    Assert::contains($fragments[0]->diff(), 'diff --git "a/some dir', 'and so is the diff --git line');
 
     Assert::case('nothing to split');
     Assert::same([], $splitter->split(''), 'empty input');

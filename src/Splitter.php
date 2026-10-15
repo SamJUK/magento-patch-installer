@@ -121,12 +121,6 @@ class Splitter
                 $this->openHunk($line, $oldLeft, $newLeft);
             }
 
-            // Unquote the header in the diff text as well as in the target.
-            // Leaving them different means retarget() silently matches nothing,
-            // and the mirrored copy of a root-mapped file is then checked
-            // against the wrong path and reported as in step.
-            $line = $this->normaliseHeader($line);
-
             // Skip the preamble: nothing before the first file header belongs
             // to a fragment.
             if ($buffer === [] && !$opensGitHeader && !$opensPlainHeader) {
@@ -141,6 +135,95 @@ class Splitter
         }
 
         return $fragments;
+    }
+
+    /**
+     * Point one fragment's file headers at another path, for the mirrored copy
+     * of a root-mapped file. Hunk bodies come back byte for byte: a line adding
+     * `++ b/pub/index.php` reads `+++ b/pub/index.php` in the diff, and
+     * rewriting it gave the two copies different code that each still verified
+     * against its own rewritten diff.
+     */
+    public function retarget(string $diff, string $from, string $to): string
+    {
+        $lines = explode("\n", $diff);
+        $oldLeft = 0;
+        $newLeft = 0;
+
+        foreach ($lines as $index => $line) {
+            if (($oldLeft > 0 || $newLeft > 0) && $this->isHunkBody($line)) {
+                $this->consume($line, $oldLeft, $newLeft);
+                continue;
+            }
+
+            $oldLeft = 0;
+            $newLeft = 0;
+
+            if (strpos($line, '@@') === 0) {
+                $this->openHunk($line, $oldLeft, $newLeft);
+            } elseif (strpos($line, 'diff --git ') === 0) {
+                $lines[$index] = $this->retargetGitHeader($line, $from, $to);
+            } elseif (strpos($line, '--- ') === 0 || strpos($line, '+++ ') === 0) {
+                $lines[$index] = $this->retargetHeader($line, $from, $to);
+            }
+        }
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * A `--- `/`+++ ` header, keeping any timestamp after the tab.
+     */
+    private function retargetHeader(string $line, string $from, string $to): string
+    {
+        $parts = explode("\t", rtrim(substr($line, 4), "\r"), 2);
+        $path = trim($parts[0]);
+        $retargeted = $this->retargetPath($path, $from, $to);
+
+        if ($retargeted === $path) {
+            return $line;
+        }
+
+        return substr($line, 0, 4)
+            . $retargeted
+            . (isset($parts[1]) ? "\t" . $parts[1] : '')
+            . (substr($line, -1) === "\r" ? "\r" : '');
+    }
+
+    /**
+     * Both paths of a `diff --git` line, which is all a mode change carries.
+     * Unquoted paths containing spaces cannot be split apart, so those are
+     * only recognised as the same file on both sides, which is how git writes
+     * them.
+     */
+    private function retargetGitHeader(string $line, string $from, string $to): string
+    {
+        $eol = substr($line, -1) === "\r" ? "\r" : '';
+        $paths = rtrim(substr($line, strlen('diff --git ')), "\r");
+
+        if (preg_match('#^("(?:\\\\.|[^"\\\\])*"|\S+) ("(?:\\\\.|[^"\\\\])*"|\S+)$#', $paths, $m) === 1) {
+            $sides = [$m[1], $m[2]];
+        } elseif ($paths === 'a/' . $from . ' b/' . $from) {
+            $sides = ['a/' . $from, 'b/' . $from];
+        } else {
+            return $line;
+        }
+
+        return 'diff --git '
+            . $this->retargetPath($sides[0], $from, $to) . ' '
+            . $this->retargetPath($sides[1], $from, $to)
+            . $eol;
+    }
+
+    /**
+     * `a/$from` or `b/$from`, quoted or not, becomes the same side of $to.
+     * Anything else, `/dev/null` included, is returned as it was.
+     */
+    private function retargetPath(string $path, string $from, string $to): string
+    {
+        $unquoted = $this->unquote($path);
+
+        return $unquoted === 'a/' . $from || $unquoted === 'b/' . $from ? $unquoted[0] . '/' . $to : $path;
     }
 
     /**
@@ -192,30 +275,6 @@ class Splitter
         if ($marker !== '-') {
             $newLeft = max(0, $newLeft - 1);
         }
-    }
-
-    /**
-     * Rewrite a quoted `--- `/`+++ ` header to the plain path. Any other line
-     * is returned exactly as it came in.
-     */
-    private function normaliseHeader(string $line): string
-    {
-        if (strpos($line, '--- ') !== 0 && strpos($line, '+++ ') !== 0) {
-            return $line;
-        }
-
-        $eol = substr($line, -1) === "\r" ? "\r" : '';
-        $parts = explode("\t", rtrim(substr($line, 4), "\r"), 2);
-        $path = trim($parts[0]);
-
-        if (strlen($path) < 2 || $path[0] !== '"' || substr($path, -1) !== '"') {
-            return $line;
-        }
-
-        return substr($line, 0, 4)
-            . $this->unquote($path)
-            . (isset($parts[1]) ? "\t" . $parts[1] : '')
-            . $eol;
     }
 
     private function pathFromHeader(string $line): string

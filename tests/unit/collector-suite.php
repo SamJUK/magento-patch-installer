@@ -7,6 +7,12 @@ declare(strict_types=1);
 
 namespace SamJUK\MagentoPatchInstaller\Tests;
 
+use Composer\IO\BufferIO;
+use Composer\Plugin\CommandEvent;
+use Composer\Plugin\PluginEvents;
+use Composer\Util\ProcessExecutor;
+use SamJUK\MagentoPatchInstaller\Applier;
+use SamJUK\MagentoPatchInstaller\Collector;
 use SamJUK\MagentoPatchInstaller\Fragment;
 use SamJUK\MagentoPatchInstaller\Renderer;
 
@@ -999,6 +1005,147 @@ return [
     Assert::same(2, count($entries), 'both patches are catalogued');
     Assert::same([], $entries['C-1']['depends'], 'the first depends on nothing');
     Assert::same(['C-1'], $entries['C-2']['depends'], 'and the second names an id, not an index');
+},
+
+'mirror' => static function (Sandbox $sandbox): void {
+    $meta = static function (array $extra): array {
+        return ['magento-patches' => $extra];
+    };
+
+    $mirror = 'vendor/magento/magento2-base/nginx.conf.sample';
+
+    /**
+     * A store whose served nginx.conf.sample and magento2-base's copy have
+     * diverged, so the mirror is patched on its own terms rather than copied.
+     *
+     * @param string[] $lines
+     */
+    $store = static function (string $name, array $lines, string $patch) use ($sandbox, $meta, $mirror): Project {
+        $p = (new Project($sandbox, $name))
+            ->root($meta(['trust' => ['acme/*']]))
+            ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]])
+            ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]));
+
+        return $p->write('nginx.conf.sample', implode("\n", $lines) . "\n")
+            ->write($mirror, implode("\n", $lines) . "\n# customised\n")
+            ->write('vendor/acme/patches/p.patch', $patch);
+    };
+
+    $header = "diff --git a/nginx.conf.sample b/nginx.conf.sample\n--- a/nginx.conf.sample\n+++ b/nginx.conf.sample\n";
+
+    Assert::case('an added line that reads like a header reaches the mirror as written');
+    // The bug the review found: retarget() rewrote every occurrence of the
+    // header text, so the served copy and the package copy got different code
+    // and verify, asking each copy about its own rewritten diff, said both
+    // were patched.
+    $p = $store('mirror-added', ['a', 'b', 'c'], $header . "@@ -1,3 +1,4 @@\n a\n b\n+++ b/nginx.conf.sample\n c\n");
+    $results = $p->patcher()->run(true);
+    Assert::same("a\nb\n++ b/nginx.conf.sample\nc\n", (string) file_get_contents($p->root . '/nginx.conf.sample'), 'the served copy');
+    Assert::same(
+        "a\nb\n++ b/nginx.conf.sample\nc\n# customised\n",
+        (string) file_get_contents($p->root . '/' . $mirror),
+        'the package copy gets the same line, and keeps its customisation'
+    );
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'the apply is clean');
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), 'and so is verify');
+
+    Assert::case('removed and context lines that read like headers still match the mirror');
+    $p = $store(
+        'mirror-removed',
+        ['a', '# diff --git a/nginx.conf.sample b/nginx.conf.sample', '-- a/nginx.conf.sample', 'd', 'e'],
+        $header . "@@ -1,4 +1,4 @@\n a\n # diff --git a/nginx.conf.sample b/nginx.conf.sample\n--- a/nginx.conf.sample\n+ x\n d\n"
+    );
+    $results = $p->patcher()->run(true);
+    Assert::same(
+        "a\n# diff --git a/nginx.conf.sample b/nginx.conf.sample\n x\nd\ne\n# customised\n",
+        (string) file_get_contents($p->root . '/' . $mirror),
+        'the package copy is patched'
+    );
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'not refused as diverged');
+
+    Assert::case('a quoted path is patched in both copies');
+    // git quotes a path with non-ASCII in it, and git apply is handed the
+    // quoted header as written for the served copy and a retargeted one for
+    // the package copy.
+    $p = (new Project($sandbox, 'mirror-quoted'))
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('magento/magento2-base', ['map' => [["caf\u{e9}.conf", "caf\u{e9}.conf"]]])
+        ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]))
+        ->write("caf\u{e9}.conf", "a\nb\n")
+        ->write("vendor/magento/magento2-base/caf\u{e9}.conf", "a\nb\n# customised\n")
+        ->write(
+            'vendor/acme/patches/p.patch',
+            "diff --git \"a/caf\\303\\251.conf\" \"b/caf\\303\\251.conf\"\n"
+            . "--- \"a/caf\\303\\251.conf\"\n+++ \"b/caf\\303\\251.conf\"\n@@ -1,2 +1,3 @@\n a\n+x\n b\n"
+        );
+    $results = $p->patcher()->run(true);
+    Assert::same("a\nx\nb\n", (string) file_get_contents($p->root . "/caf\u{e9}.conf"), 'the served copy');
+    Assert::same("a\nx\nb\n# customised\n", (string) file_get_contents($p->root . "/vendor/magento/magento2-base/caf\u{e9}.conf"), 'the package copy');
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'cleanly');
+    Assert::same(Renderer::OK, Renderer::exitCode($p->patcher()->run(false)), 'and verify agrees');
+
+    Assert::case('a mirror whose customisation is in the way is still refused');
+    // The control: a copy that really has diverged under the hunk.
+    $p = (new Project($sandbox, 'mirror-diverged'))
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]])
+        ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]))
+        ->write('nginx.conf.sample', "a\nb\nc\n")
+        ->write($mirror, "a\nB\nc\n")
+        ->write('vendor/acme/patches/p.patch', $header . "@@ -1,3 +1,4 @@\n a\n b\n+x\n c\n");
+    $results = $p->patcher()->run(true);
+    Assert::same("a\nB\nc\n", (string) file_get_contents($p->root . '/' . $mirror), 'the customised copy is left alone');
+    Assert::true(Renderer::exitCode($results) !== Renderer::OK, 'and the run says so');
+
+    Assert::case('copies in step are still copied across');
+    $p = (new Project($sandbox, 'mirror-lockstep'))
+        ->root($meta(['trust' => ['acme/*']]))
+        ->package('magento/magento2-base', ['map' => [['nginx.conf.sample', 'nginx.conf.sample']]])
+        ->package('acme/patches', $meta(['patches' => [['id' => 'P-1', 'source' => 'p.patch']]]))
+        ->write('nginx.conf.sample', "a\nb\nc\n")
+        ->write($mirror, "a\nb\nc\n")
+        ->write('vendor/acme/patches/p.patch', $header . "@@ -1,3 +1,4 @@\n a\n b\n+++ b/nginx.conf.sample\n c\n");
+    $results = $p->patcher()->run(true);
+    Assert::same((string) file_get_contents($p->root . '/nginx.conf.sample'), (string) file_get_contents($p->root . '/' . $mirror), 'both copies match');
+    Assert::same(Renderer::OK, Renderer::exitCode($results), 'cleanly');
+
+    Assert::case('retarget rewrites the headers and nothing else');
+    $applier = new Applier(new ProcessExecutor(), $sandbox->root());
+    $body = "@@ -1,4 +1,4 @@\n diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n keep\n";
+    Assert::same(
+        "diff --git a/y.txt b/y.txt\n--- a/y.txt\n+++ b/y.txt\n" . $body,
+        $applier->retarget("diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n" . $body, 'x.txt', 'y.txt'),
+        'header-like body lines are untouched'
+    );
+    Assert::same(
+        "diff --git a/y.txt b/y.txt\r\n--- a/y.txt\t2026-10-14 12:00:00\r\n+++ b/y.txt\t2026-10-14 12:00:00\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n",
+        $applier->retarget(
+            "diff --git a/x.txt b/x.txt\r\n--- a/x.txt\t2026-10-14 12:00:00\r\n+++ b/x.txt\t2026-10-14 12:00:00\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n",
+            'x.txt',
+            'y.txt'
+        ),
+        'line endings and timestamps survive'
+    );
+    Assert::same(
+        "diff --git a/y.txt b/y.txt\nold mode 100644\nnew mode 100755\n",
+        $applier->retarget("diff --git \"a/x.txt\" \"b/x.txt\"\nold mode 100644\nnew mode 100755\n", 'x.txt', 'y.txt'),
+        'a quoted diff --git line, which is all a mode change has'
+    );
+    Assert::same(
+        "--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-a\n+b\n",
+        $applier->retarget("--- \"a/x.txt\"\n+++ \"b/x.txt\"\n@@ -1 +1 @@\n-a\n+b\n", 'x.txt', 'y.txt'),
+        'and quoted header pairs'
+    );
+    Assert::same(
+        "diff --git a/x.txt.dist b/x.txt.dist\n--- a/x.txt.dist\n+++ b/x.txt.dist\n@@ -1 +1 @@\n-a\n+b\n",
+        $applier->retarget("diff --git a/x.txt.dist b/x.txt.dist\n--- a/x.txt.dist\n+++ b/x.txt.dist\n@@ -1 +1 @@\n-a\n+b\n", 'x.txt', 'y.txt'),
+        'a longer path that starts with the same name is not this file'
+    );
+    Assert::same(
+        "diff --git a/y.txt b/y.txt\nnew file mode 100644\n--- /dev/null\n+++ b/y.txt\n@@ -0,0 +1 @@\n+a\n",
+        $applier->retarget("diff --git a/x.txt b/x.txt\nnew file mode 100644\n--- /dev/null\n+++ b/x.txt\n@@ -0,0 +1 @@\n+a\n", 'x.txt', 'y.txt'),
+        '/dev/null is left as it is'
+    );
 },
 
 ];

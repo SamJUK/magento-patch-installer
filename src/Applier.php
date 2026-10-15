@@ -144,13 +144,7 @@ class Applier
      */
     public function retarget(string $diff, string $from, string $to): string
     {
-        $patterns = [
-            'diff --git a/' . $from . ' b/' . $from => 'diff --git a/' . $to . ' b/' . $to,
-            '--- a/' . $from => '--- a/' . $to,
-            '+++ b/' . $from => '+++ b/' . $to,
-        ];
-
-        return str_replace(array_keys($patterns), array_values($patterns), $diff);
+        return (new Splitter())->retarget($diff, $from, $to);
     }
 
     /**
