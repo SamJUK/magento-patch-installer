@@ -36,6 +36,15 @@ class Collector
     /** @var array<int, array<string, mixed>>|null */
     private $collected;
 
+    /** @var array<string, PackageInterface> installed package name => package */
+    private $installed = [];
+
+    /** @var array<string, array<string, true>> source => every package it requires */
+    private $required = [];
+
+    /** @var array<string, string> replaced or provided name => installed package standing in for it */
+    private $replacements = [];
+
     public function __construct(Composer $composer)
     {
         $this->composer = $composer;
@@ -63,7 +72,17 @@ class Collector
 
         $declarations = $this->fromPackage($root, $this->rootDirectory());
 
-        foreach ($this->composer->getRepositoryManager()->getLocalRepository()->getPackages() as $package) {
+        $packages = $this->composer->getRepositoryManager()->getLocalRepository()->getPackages();
+
+        foreach ($packages as $package) {
+            $this->installed[$package->getName()] = $package;
+
+            foreach (array_merge($package->getReplaces(), $package->getProvides()) as $link) {
+                $this->replacements[strtolower($link->getTarget())] = $package->getName();
+            }
+        }
+
+        foreach ($packages as $package) {
             if (!$this->isTrusted($package->getName(), $trust)) {
                 // Silence here is indistinguishable from a fully patched store:
                 // forget the trust entry and everything reports clean.
@@ -90,9 +109,203 @@ class Collector
             $declarations = array_merge($declarations, $this->fromPackage($package, $installPath));
         }
 
-        $this->collected = $this->select($declarations);
+        // Ordered once, across every source. A store's own patch built on a
+        // trusted package's chain is collected first, and ordering each package
+        // on its own put it beneath the very months it rewrites.
+        $this->collected = $this->select($this->order($this->crossLink($declarations)));
 
         return $this->collected;
+    }
+
+    /**
+     * Resolve the `depends` a package could not satisfy itself, against every
+     * other source on the same base line: the root and each trusted package.
+     *
+     * A package's own declaration of an id always wins, so two packages
+     * shipping the same ids keep separate chains. Otherwise exactly one other
+     * source must declare it. Where several do, a bare id means the one the
+     * declarer `require`s: that is declared, not guessed, and it is what stops
+     * a third package that happens to ship the same id from making an add-on's
+     * patch ambiguous. Anything still unsettled is a configuration error, and
+     * the patch is marked so it is refused rather than applied out of order.
+     *
+     * @param array<int, array<string, mixed>> $declarations
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function crossLink(array $declarations): array
+    {
+        $byLineAndId = $linesOf = [];
+
+        foreach ($declarations as $index => $declaration) {
+            $line = (string) ($declaration['line'] ?? '');
+            $byLineAndId[$line][(string) $declaration['id']][] = $index;
+            $linesOf[(string) $declaration['id']][$line] = true;
+        }
+
+        foreach ($declarations as $index => $declaration) {
+            $line = (string) ($declaration['line'] ?? '');
+
+            foreach ($declaration['pending'] as $reference) {
+                // First per owner: one owner declaring an id twice is that
+                // owner's "declared twice" error, not two candidates.
+                $candidates = [];
+
+                foreach ($byLineAndId[$line][$reference['id']] ?? [] as $other) {
+                    $owner = $declarations[$other]['owner'];
+
+                    if ($owner !== $declaration['owner']
+                        && ($reference['owner'] ?? $owner) === $owner
+                        && !isset($candidates[$owner])) {
+                        $candidates[$owner] = $other;
+                    }
+                }
+
+                if (count($candidates) > 1) {
+                    $required = array_intersect_key($candidates, $this->requiredBy((string) $declaration['owner']));
+
+                    if (count($required) === 1) {
+                        $candidates = $required;
+                    }
+                }
+
+                if (count($candidates) === 1) {
+                    $declarations[$index]['depends'][] = $declarations[(int) reset($candidates)]['origin'];
+                    continue;
+                }
+
+                $named = $reference['owner'] === null
+                    ? $reference['id']
+                    : $reference['owner'] . ':' . $reference['id'];
+                $declarations[$index]['unresolved'][] = $named;
+                $where = $line === '' ? 'top-level "patches"' : $line;
+
+                if ($candidates === []) {
+                    $elsewhere = array_keys(array_diff_key($linesOf[$reference['id']] ?? [], [$line => true]));
+                    $declarations[$index]['unresolvedWhy'] = $elsewhere === []
+                        ? sprintf('depends on %s, which nothing declares for %s', $named, $where)
+                        : sprintf('depends on %s, which is only declared for another base line', $named);
+
+                    $this->errors[] = $elsewhere === []
+                        ? sprintf(
+                            '%s: patch "%s" depends on "%s", which is not declared for %s',
+                            $declaration['owner'],
+                            $declaration['label'],
+                            $named,
+                            $where
+                        )
+                        : sprintf(
+                            '%s: patch "%s" depends on "%s", which is only declared for %s — a patch can only '
+                            . 'build on one in its own base line, so declare it in that line instead of %s',
+                            $declaration['owner'],
+                            $declaration['label'],
+                            $named,
+                            implode(', ', array_map(static function ($other): string {
+                                return (string) $other === '' ? 'top-level "patches"' : (string) $other;
+                            }, $elsewhere)),
+                            $where
+                        );
+                    continue;
+                }
+
+                $owners = array_keys($candidates);
+                $declarations[$index]['unresolvedWhy'] = sprintf(
+                    'depends on %s, which %s all declare',
+                    $named,
+                    implode(', ', $owners)
+                );
+
+                // Only the root can be told to fix its own config. A package's
+                // declarations are its author's, so say whose they are.
+                $this->errors[] = $declaration['owner'] === $this->composer->getPackage()->getName()
+                    ? sprintf(
+                        '%s: patch "%s" depends on "%s", which %s all declare for %s — name one, e.g. "%s:%s"',
+                        $declaration['owner'],
+                        $declaration['label'],
+                        $named,
+                        implode(', ', $owners),
+                        $where,
+                        $owners[0],
+                        $reference['id']
+                    )
+                    : sprintf(
+                        '%s: patch "%s" depends on "%s", which %s all declare for %s — %s should require the '
+                        . 'package it builds on, or name it as "vendor/package:%s"',
+                        $declaration['owner'],
+                        $declaration['label'],
+                        $named,
+                        implode(', ', $owners),
+                        $where,
+                        $declaration['owner'],
+                        $reference['id']
+                    );
+            }
+        }
+
+        return $declarations;
+    }
+
+    /**
+     * Every package a source requires, directly or through other packages.
+     *
+     * @return array<string, true>
+     */
+    private function requiredBy(string $owner): array
+    {
+        if (isset($this->required[$owner])) {
+            return $this->required[$owner];
+        }
+
+        $root = $this->composer->getPackage();
+        $queue = $owner === $root->getName()
+            ? array_merge(array_keys($root->getRequires()), array_keys($root->getDevRequires()))
+            : (isset($this->installed[$owner]) ? array_keys($this->installed[$owner]->getRequires()) : []);
+        $seen = [];
+
+        while ($queue !== []) {
+            $name = strtolower((string) array_pop($queue));
+
+            if (isset($seen[$name])) {
+                continue;
+            }
+
+            $seen[$name] = true;
+
+            // A fork installed in its place replaces it by name.
+            if (!isset($this->installed[$name]) && isset($this->replacements[$name])) {
+                $queue[] = $this->replacements[$name];
+                continue;
+            }
+
+            if (isset($this->installed[$name])) {
+                $queue = array_merge($queue, array_keys($this->installed[$name]->getRequires()));
+            }
+        }
+
+        return $this->required[$owner] = $seen;
+    }
+
+    /**
+     * Does $owner require $other, directly or through other packages?
+     */
+    public function requires(string $owner, string $other): bool
+    {
+        return isset($this->requiredBy($owner)[strtolower($other)]);
+    }
+
+    /**
+     * A `depends` entry is an id, or `vendor/package:id` when the id alone
+     * could mean a patch in more than one package.
+     *
+     * @return array{owner: string|null, id: string}
+     */
+    private function reference(string $needs): array
+    {
+        if (preg_match('#^([a-z0-9_.-]+/[a-z0-9_.-]+):(.+)$#', $needs, $matches) === 1) {
+            return ['owner' => $matches[1], 'id' => $matches[2]];
+        }
+
+        return ['owner' => null, 'id' => $needs];
     }
 
     /**
@@ -267,6 +480,10 @@ class Collector
                 continue;
             }
 
+            // This package's own dependents only. Counting another source's
+            // would let any trusted package cancel the store's skip of this
+            // one just by depending on it — and the skipped patch is applied.
+            // The cascade still takes every dependent down, whoever owns it.
             foreach ($mine as $other) {
                 if (in_array($declaration['origin'], $other['depends'], true)) {
                     return true;
@@ -446,7 +663,14 @@ class Collector
             $declarations = $this->link($declarations, $group, $package, (string) $line);
         }
 
-        return $this->order($declarations);
+        // Globally unique. Origins used to restart at 0 for each package, and
+        // every consumer built its lookup over the merged list, so the last
+        // package silently owned every earlier package's edges.
+        foreach ($declarations as $index => $declaration) {
+            $declarations[$index]['origin'] = $declaration['owner'] . '#' . $index;
+        }
+
+        return $declarations;
     }
 
     /**
@@ -518,16 +742,15 @@ class Collector
             $edges = [];
 
             foreach ($declaration['depends'] as $needs) {
-                $target = $byId[(string) $needs] ?? null;
+                $reference = $this->reference((string) $needs);
+                $target = $reference['owner'] === null || $reference['owner'] === $package->getName()
+                    ? $byId[$reference['id']] ?? null
+                    : null;
 
                 if ($target === null) {
-                    $this->errors[] = sprintf(
-                        '%s: patch "%s" depends on "%s", which is not declared%s',
-                        $package->getName(),
-                        $declaration['label'],
-                        (string) $needs,
-                        $line === '' ? '' : ' for ' . $line
-                    );
+                    // Not this package's, so possibly another source's: settled
+                    // once every trusted package has been read.
+                    $declarations[$index]['pending'][] = $reference;
                     continue;
                 }
 
@@ -560,6 +783,11 @@ class Collector
      * Depth-first topological order, with declaration order as the tiebreak so
      * two independent patches keep the order they were written in.
      *
+     * A package goes after the packages it requires. That is how an add-on
+     * says it builds on one, and it is a constraint, not a starting point: a
+     * store's private package sorting first, or anything that depends on its
+     * patch reaching it first, otherwise put it beneath the chain it extends.
+     *
      * @param array<int, array<string, mixed>> $declarations
      *
      * @return array<int, array<string, mixed>>
@@ -568,47 +796,92 @@ class Collector
     {
         $ordered = [];
         $state = [];
-        $cycles = 0;
+        $position = [];
+        $cyclic = [];
 
-        // One shared stack rather than a copy per frame. Passing the path by
-        // value cost O(n²) memory on a chain declared back to front, and a
-        // package chooses that order — 12,000 patches was a fatal, which
-        // nothing can catch, in every consumer's composer install.
-        $path = [];
+        foreach ($declarations as $index => $declaration) {
+            $position[$declaration['origin']] = $index;
+        }
 
-        $visit = function (int $index) use (&$visit, &$ordered, &$state, &$path, &$cycles, $declarations): void {
-            if (($state[$index] ?? null) === 'done') {
-                return;
+        // Every declaration of the packages each owner requires, and not the
+        // other way round. The root requires everything and is ordered by its
+        // `depends` alone.
+        $root = $this->composer->getPackage()->getName();
+        $byOwner = $beneath = $entered = [];
+
+        foreach ($declarations as $index => $declaration) {
+            $byOwner[(string) $declaration['owner']][] = $index;
+        }
+
+        foreach (array_keys($byOwner) as $owner) {
+            foreach ($byOwner as $other => $indices) {
+                if ((string) $owner !== $root
+                    && $other !== $owner
+                    && $this->requires((string) $owner, (string) $other)
+                    && !$this->requires((string) $other, (string) $owner)) {
+                    $beneath[$owner] = array_merge($beneath[$owner] ?? [], $indices);
+                }
+            }
+        }
+
+        // What each patch needs before it: what it depends on, and through one
+        // node per package rather than an edge from every link to every link,
+        // every patch of the packages its package requires.
+        $needs = [];
+
+        foreach ($declarations as $index => $declaration) {
+            foreach ($declaration['depends'] as $origin) {
+                if (isset($position[$origin])) {
+                    $needs[$index][] = $position[$origin];
+                }
             }
 
-            if (($state[$index] ?? null) === 'open') {
-                // One message per run, not one per back-edge with the whole
-                // path in each: a complete graph made the error text alone
-                // grow cubically and exhausted memory before it printed.
-                if ($cycles++ === 0) {
-                    $this->errors[] = sprintf(
-                        '%s: "%s" is part of a dependency cycle',
-                        $declarations[$index]['owner'],
-                        $declarations[$index]['label']
-                    );
-                }
+            if (isset($beneath[(string) $declaration['owner']])) {
+                $needs[$index][] = 'package:' . $declaration['owner'];
+            }
+        }
 
+        foreach ($beneath as $owner => $indices) {
+            $needs['package:' . $owner] = $indices;
+        }
+
+        $refused = $this->unorderable($declarations, $needs, $position);
+
+        foreach (array_keys($refused) as $index) {
+            $cyclic[$declarations[$index]['origin']] = true;
+        }
+
+        $visit = function (int $index) use (&$visit, &$ordered, &$state, &$entered, $refused, $beneath, $declarations, $position): void {
+            // Done, or open: every cycle was settled above by refusing a patch
+            // in it, and a refused patch's prerequisites, its package's
+            // included, are not followed. Followed, they could reach a patch
+            // built on it and place that first, before it is known refused.
+            if (isset($state[$index])) {
                 return;
             }
 
             $state[$index] = 'open';
-            $path[] = $index;
+            $owner = (string) $declarations[$index]['owner'];
 
-            foreach ($declarations[$index]['depends'] as $needs) {
-                $visit((int) substr((string) $needs, strrpos((string) $needs, '#') + 1));
+            if (!isset($refused[$index]) && !isset($entered[$owner])) {
+                $entered[$owner] = true;
+
+                foreach ($beneath[$owner] ?? [] as $required) {
+                    $visit($required);
+                }
             }
 
-            array_pop($path);
+            // Edges are origins, so one crossing into another package is
+            // followed exactly like one inside it.
+            if (!isset($refused[$index])) {
+                foreach ($declarations[$index]['depends'] as $needed) {
+                    if (isset($position[$needed])) {
+                        $visit($position[$needed]);
+                    }
+                }
+            }
+
             $state[$index] = 'done';
-            // Globally unique. Origins used to restart at 0 for each package,
-            // and every consumer built its lookup over the merged list, so the
-            // last package silently owned every earlier package's edges.
-            $declarations[$index]['origin'] = $declarations[$index]['owner'] . '#' . $index;
             $ordered[] = $declarations[$index];
         };
 
@@ -616,11 +889,254 @@ class Collector
             $visit($index);
         }
 
+        foreach ($ordered as $index => $declaration) {
+            $ordered[$index]['cyclic'] = isset($cyclic[$declaration['origin']]);
+        }
+
+        return $ordered;
+    }
+
+    /**
+     * The patches no order can place, refused so the rest can be ordered.
+     *
+     * A cycle of `depends` alone has no order in which any of it is right, so
+     * all of it is refused. A cycle through a require is a `depends` running
+     * against that require: a patch whose prerequisites lead, by `depends`, to
+     * a patch in a package that requires the patch's own. Only that patch is
+     * refused, with what builds on it. The patch it depends on did nothing
+     * wrong, and a library a security package requires must not be able to
+     * switch that package's patch off. A cycle through requires where no
+     * `depends` runs against one refuses the patches whose `depends` crosses
+     * into another package in it, and not those only there through their
+     * package or their own package's chain. Settled on the graph as a whole,
+     * then again on what is left, until nothing loops.
+     *
+     * @param array<int, array<string, mixed>> $declarations
+     * @param array<int|string, array<int, int|string>> $needs node => nodes needed before it; packages are "package:<name>"
+     * @param array<string, int> $position
+     *
+     * @return array<int, true>
+     */
+    private function unorderable(array $declarations, array $needs, array $position): array
+    {
+        $root = $this->composer->getPackage()->getName();
+        $refused = [];
+        $cycles = 0;
+        $owner = static function (int $index) use ($declarations): string {
+            return (string) $declarations[$index]['owner'];
+        };
+
+        do {
+            $found = [];
+            $edges = [];
+
+            foreach ($needs as $node => $targets) {
+                if (!is_int($node) || !isset($refused[$node])) {
+                    $edges[$node] = $targets;
+                }
+            }
+
+            foreach (self::components(array_merge(array_keys($declarations), array_keys($needs)), $edges) as $component) {
+                if (count($component) === 1 && !in_array($component[0], $edges[$component[0]] ?? [], true)) {
+                    continue;
+                }
+
+                $members = array_flip($component);
+                $patches = array_values(array_filter($component, 'is_int'));
+                $against = $dependents = $declarers = $byOwner = [];
+
+                foreach ($patches as $patch) {
+                    $byOwner[$owner($patch)][] = $patch;
+
+                    foreach ($this->dependsOn($declarations[$patch], $position, $members) as $needed) {
+                        $dependents[$needed][] = $patch;
+
+                        if (count($patches) === count($component) || $owner($needed) !== $owner($patch)) {
+                            $declarers[$patch] = $patch;
+                        }
+                    }
+                }
+
+                if (count($patches) < count($component)) {
+                    // Walked back from each package's patches, once per package:
+                    // a patch that leads to one by depends, from a package that
+                    // package requires, runs against the require.
+                    foreach ($byOwner as $theirs => $targets) {
+                        $theirs = (string) $theirs;
+
+                        if ($theirs === $root) {
+                            continue;
+                        }
+
+                        $queue = [];
+                        $seen = [];
+
+                        foreach ($targets as $target) {
+                            $queue[] = [$target, $target];
+                        }
+
+                        while ($queue !== []) {
+                            [$node, $target] = array_pop($queue);
+
+                            foreach ($dependents[$node] ?? [] as $before) {
+                                if (isset($seen[$before])) {
+                                    continue;
+                                }
+
+                                $seen[$before] = true;
+                                $queue[] = [$before, $target];
+                                $mine = $owner($before);
+
+                                if (!isset($against[$before]) && $mine !== $root && $mine !== $theirs
+                                    && $this->requires($theirs, $mine) && !$this->requires($mine, $theirs)) {
+                                    $against[$before] = ['depends' => $node, 'leads' => $owner($node) === $theirs ? $node : $target];
+                                }
+                            }
+                        }
+                    }
+
+                    ksort($against);
+                }
+
+                if ($cycles++ === 0) {
+                    $first = $against === [] ? null : (int) array_key_first($against);
+                    $named = $first === null ? (int) reset($declarers) : $first;
+                    $this->errors[] = $first === null
+                        ? sprintf('%s: "%s" is part of a dependency cycle', $owner($named), $declarations[$named]['label'])
+                        : sprintf(
+                            '%s: "%s" depends on "%s"%s, but %s requires %s, so its patches go first — '
+                            . 'the depends runs against the require, and "%s" is refused',
+                            $owner($first),
+                            $declarations[$first]['label'],
+                            $declarations[$against[$first]['depends']]['label'],
+                            $against[$first]['depends'] === $against[$first]['leads']
+                                ? ''
+                                : sprintf(', which leads to "%s"', $declarations[$against[$first]['leads']]['label']),
+                            $owner($against[$first]['leads']),
+                            $owner($first),
+                            $declarations[$first]['label']
+                        );
+                }
+
+                // Nothing against a require: refusing what declares a depends into
+                // another package in the cycle breaks it. Requires alone never
+                // loop, and a depends within a package, a chain's link to the one
+                // before, keeps to the same package. A patch that only sits in
+                // it, through its package or its own chain, did nothing wrong.
+                foreach ($against === [] ? $declarers : array_keys($against) as $patch) {
+                    $found[$patch] = true;
+                }
+            }
+
+            $refused += $found;
+        } while ($found !== []);
+
         if ($cycles > 1) {
             $this->errors[] = sprintf('%d further dependency cycles were not listed', $cycles - 1);
         }
 
-        return $ordered;
+        return $refused;
+    }
+
+    /**
+     * The patches among $members that $declaration names in `depends`.
+     *
+     * @param array<string, mixed> $declaration
+     * @param array<string, int> $position
+     * @param array<int|string, int> $members
+     *
+     * @return int[]
+     */
+    private function dependsOn(array $declaration, array $position, array $members): array
+    {
+        $out = [];
+
+        foreach ($declaration['depends'] as $origin) {
+            if (isset($position[$origin], $members[$position[$origin]])) {
+                $out[] = $position[$origin];
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Strongly connected components (Tarjan), without recursion: a chain of
+     * thousands is a stack that deep.
+     *
+     * @param array<int, int|string> $nodes
+     * @param array<int|string, array<int, int|string>> $edges
+     *
+     * @return array<int, array<int, int|string>>
+     */
+    private static function components(array $nodes, array $edges): array
+    {
+        $inGraph = array_flip($nodes);
+        $order = $low = $onStack = [];
+        $stack = $components = [];
+        $counter = 0;
+
+        foreach ($nodes as $start) {
+            if (isset($order[$start])) {
+                continue;
+            }
+
+            $order[$start] = $low[$start] = $counter++;
+            $stack[] = $start;
+            $onStack[$start] = true;
+            $work = [[$start, 0]];
+
+            while ($work !== []) {
+                $top = count($work) - 1;
+                [$node, $next] = $work[$top];
+                $targets = $edges[$node] ?? [];
+
+                if ($next < count($targets)) {
+                    $work[$top][1]++;
+                    $to = $targets[$next];
+
+                    if (!isset($inGraph[$to])) {
+                        continue;
+                    }
+
+                    if (!isset($order[$to])) {
+                        $order[$to] = $low[$to] = $counter++;
+                        $stack[] = $to;
+                        $onStack[$to] = true;
+                        $work[] = [$to, 0];
+                    } elseif (isset($onStack[$to])) {
+                        $low[$node] = min($low[$node], $order[$to]);
+                    }
+
+                    continue;
+                }
+
+                array_pop($work);
+
+                if ($work !== []) {
+                    $parent = $work[count($work) - 1][0];
+                    $low[$parent] = min($low[$parent], $low[$node]);
+                }
+
+                if ($low[$node] === $order[$node]) {
+                    $component = [];
+
+                    while ($stack !== []) {
+                        $member = array_pop($stack);
+                        unset($onStack[$member]);
+                        $component[] = $member;
+
+                        if ($member === $node) {
+                            break;
+                        }
+                    }
+
+                    $components[] = $component;
+                }
+            }
+        }
+
+        return $components;
     }
 
     /**
@@ -896,6 +1412,10 @@ class Collector
             'line' => $line,
             'cumulative' => $cumulative,
             'depends' => $depends,
+            // `depends` this package could not satisfy itself, until crossLink()
+            // settles them; and the ones nothing satisfies, which block the patch.
+            'pending' => [],
+            'unresolved' => [],
             'description' => isset($entry['description']) ? trim((string) $entry['description']) : null,
         ];
     }

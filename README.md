@@ -22,7 +22,7 @@ composer config --no-plugins allow-plugins.samjuk/magento-patch-installer true
 composer require samjuk/magento-patch-installer
 ```
 
-Composer does not run a plugin it has not been told to trust. In an interactive terminal it asks; in CI it does not — it skips the plugin, says nothing about it, and exits `0` having applied no patches at all, which is why the `allow-plugins` line comes first.
+Composer does not run a plugin it has not been told to trust. In an interactive terminal it asks; in CI it stops with an error naming the plugin. Answer "n" to that question once, or set the entry to `false`, and from then on it skips the plugin without a word and exits `0` having applied no patches at all. That is why the `allow-plugins` line comes first.
 
 ### Trust the packages that ship your patches (required)
 
@@ -61,7 +61,7 @@ Four commands, split by the question each one answers.
 
 ### `composer magento-patches:list`
 
-Every patch the trusted packages declare, grouped by package and then by the base version it was built for. It never touches the working tree and never runs git, so it answers on a fresh clone before `composer install` has run.
+Every patch the trusted packages declare, grouped by package and then by the base version it was built for. It never touches the working tree and never runs git, so it is safe to run against any store.
 
 ```
 $ composer magento-patches:list
@@ -78,7 +78,7 @@ $ composer magento-patches:list
   6 patches · 5 apply to this install (-v for sources and reasons)
 ```
 
-Base constraints are still checked, because those come from the lock file rather than from disk, so it says which patches are *for* this install without claiming any are applied. Add `-v` for each patch's description, its source path, and why the ones that do not apply here do not.
+Base constraints are still checked, against what Composer records as installed rather than against the files, so it says which patches are *for* this install without claiming any are applied. Add `-v` for each patch's description, its source path, and why the ones that do not apply here do not.
 
 ### `composer magento-patches:status`
 
@@ -199,7 +199,7 @@ All four commands take `--json`, for pipelines that would rather act on the resu
 | `2` | Conflict: a target matches neither side of the patch |
 | `3` | Configuration or trust error |
 
-All four also fail the Composer run itself, including `3`. A configuration error usually means declarations were dropped — a missing `trust` entry, a renamed patch file — which leaves nothing to derive a verdict from, and a clean exit there is indistinguishable from a fully patched store. Set `extra.magento-patches.allow-unpatched` to `true` to continue anyway.
+`1`, `2` and `3` also fail the Composer run itself, which exits `1`. A configuration error usually means declarations were dropped — a missing `trust` entry, a renamed patch file — which leaves nothing to derive a verdict from, and a clean exit there is indistinguishable from a fully patched store. Set `extra.magento-patches.allow-unpatched` to `true` to continue anyway.
 
 **A patch is applied as a unit.** If any one of its files will not take the patch, none of them are written. A security fix on three of its four files is not three quarters applied — the files Adobe changes together depend on each other, and a half-applied change can break the site. A file this store does not have, because the package is replaced, not installed, or does not ship it, is not a refusal and never blocks the rest.
 
@@ -210,7 +210,7 @@ All four also fail the Composer run itself, including `3`. A configuration error
 Not because the install-time run is unreliable, but because there are two ordinary ways for it not to happen at all, and neither of them says so:
 
 - `composer install --no-plugins` runs the whole install and exits `0` having applied nothing. No plugin can report this, because no plugin ran.
-- A missing `allow-plugins` entry does the same. Composer 2.2+ blocks plugins it has not been told to trust, and in a non-interactive run — which is every CI run — it blocks them silently.
+- An `allow-plugins` entry set to `false` does the same, and answering "n" when Composer asks writes exactly that. Composer then skips the plugin without a word. (With no entry at all, a non-interactive run stops with an error, which at least fails the build.)
 
 Both produce a green build over an unpatched store, so a patcher that can be switched off without a word needs a witness outside itself.
 
@@ -219,7 +219,7 @@ Both produce a green build over an unpatched store, so a patcher that can be swi
 - run: composer magento-patches:verify --no-interaction
 ```
 
-The same step catches a root file going missing between deploys. Anything that re-deploys `magento2-base` without going through Composer — an rsync, a `cp -r` in a Dockerfile, `bin/magento setup:upgrade` — is invisible to this plugin because there is no Composer event to hook. `magento-patches:verify` reads the working tree and will tell you.
+The same step catches a patched root file being reverted, or going missing, between deploys. Anything that re-deploys `magento2-base` without going through Composer — an rsync, a `cp -r` in a Dockerfile, `bin/magento setup:upgrade` — is invisible to this plugin because there is no Composer event to hook. `magento-patches:verify` reads the working tree and will tell you.
 
 ## Declaring Patches
 
@@ -264,7 +264,7 @@ Patches are declared in the root `composer.json`, or in any package named in `tr
 | `base` | Yes for `patches` | Base-version marker deciding whether the patch belongs to this install. Inherited from the line for `lines` entries |
 | `label` | No | Short friendly name — `StyleSmuggler`, `Session Reaper` — shown beside the id in every report |
 | `description` | No | Longer prose, shown under `magento-patches:list -v` |
-| `depends` | No | Ids this patch is built on. Not valid in a cumulative line, which derives its own |
+| `depends` | No | Ids this patch is built on, in its own base line: its own package's, or another source's (see [Patches from several sources](#patches-from-several-sources)). Not valid in a cumulative line, which derives its own |
 
 **Do not list the modules a patch happens to touch in `base`.** It is a base-version marker and nothing else. Listing modules is exactly what makes a `replace`d module lose an entire patch, and per-target classification already handles missing modules properly.
 
@@ -294,9 +294,54 @@ Nothing declares `depends`, and declaring one here is an error — the line alre
 { "id": "ACME-2", "source": "...", "depends": ["ACME-1"] }
 ```
 
-This crosses lines and packages, which array order could never express. A `depends` naming something undeclared, a patch depending on itself, and a cycle are all configuration errors.
+A patch with a prerequisite that cannot be found, or that is part of a cycle, is refused and never written, along with everything built on it: there is no order in which applying it would be right.
 
 Patches apply in dependency order, so outside a cumulative line the order they are written in — including the order of an `include` list — carries no meaning.
+
+### Patches from several sources
+
+`depends` crosses packages, which array order never could: the store's own `composer.json`, or one trusted package, can build on another source's patch. The commonest reason is a month a package cannot ship (Adobe keeps some files for Adobe Commerce licence holders), added by the store itself on top of that package's chain:
+
+```json
+"extra": {
+    "magento-patches": {
+        "trust": ["samjuk/*"],
+        "lines": {
+            "2.4.6-p15": {
+                "base": { "magento/magento2-base": "2.4.6-p15" },
+                "patches": [
+                    {
+                        "id": "2026-10-001",
+                        "source": "patches/246p15-2026-10-001-CE.patch",
+                        "depends": ["2026-09-001", "APSB26-146"]
+                    }
+                ]
+            }
+        }
+    }
+}
+```
+
+How a `depends` id is found:
+
+- **Within one base line.** Top-level `patches` count as a line of their own, so a patch built on a line's chain has to be declared in that line.
+- **The declaring package's own patch first.** Two packages shipping the same ids keep separate chains.
+- **Otherwise exactly one other source.** Where several declare the id, a bare id means the one the declarer requires, directly or through other packages, so an add-on that requires the package it builds on stays unambiguous whatever else is installed. Anything still ambiguous must be named as `vendor/package:id`.
+
+A `depends` that nothing declares, or that several sources could still answer, is a configuration error, and the patch is refused.
+
+**Your patch and a package's on the same file need an order.** If the store's own patch changes a file that a trusted package's patch also changes, and neither depends on the other, the store's patch is refused with a configuration error that names the package's patch to add to `depends`. Name every one it overlaps. In the example above that is the month before *and* the StyleSmuggler hotfix, which shares two files with October and is not part of the monthly chain. The package's patch is never the one refused: nothing a store or a sibling declares can switch off a trusted package's security patch. The check only applies where `depends` could fix it; a store's top-level patch against a package's line gets a warning saying where to declare it instead.
+
+**A package goes on top of the packages it requires.** Requiring a package is how an add-on says it builds on it, so its patches apply after that package's, and one that changes the same file is checked as built on it, exactly as if it had named it in `depends`. A private package carrying the licensed month above needs only to require this one. The store's own `composer.json` gets no such rule: it requires everything, so its patches still need `depends`.
+
+Between two packages where neither requires the other, the same overlap is only a warning. Neither vendor knows about the other and the store cannot edit their declarations, so refusing would make them impossible to install together; a real clash still fails the run as a conflict. Within one package two independent fixes to a file are normal, and the author owns their order.
+
+**Removing a package that builds on another.** `composer remove` takes the package's patch files away, not the changes they made. The patches beneath them are then checked without what sits on top, and read as conflicts on every run until the files are reinstalled. Take its patches off first, then remove it:
+
+1. Skip each of its patches under `extra.magento-patches.sources`, keyed by the package's name, and run `composer magento-patches:apply`, which takes them off.
+2. Delete that `sources` entry, which would otherwise name a package that declares nothing, and `composer remove` the package.
+
+If it has already gone, `composer reinstall` the packages whose files the conflicts name.
 
 ### Splitting declarations across files
 

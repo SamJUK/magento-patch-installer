@@ -59,8 +59,7 @@ class PatchCommand extends BaseCommand
         $composer = $this->composer();
         $patcher = Patcher::fromComposer($composer, $this->getIO());
 
-        // The catalogue never touches the working tree, so it is the one command
-        // that answers before `composer install` has ever run.
+        // The catalogue never touches the working tree, and runs no git.
         if ($this->mode === self::MODE_LIST) {
             return $this->catalogue($patcher, $input, $output);
         }

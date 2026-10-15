@@ -10,10 +10,12 @@ namespace SamJUK\MagentoPatchInstaller\Tests;
 use Composer\Composer;
 use Composer\Config;
 use Composer\Installer\InstallationManager;
+use Composer\Package\Link;
 use Composer\Package\Package;
 use Composer\Package\RootPackage;
 use Composer\Repository\InstalledArrayRepository;
 use Composer\Repository\RepositoryManager;
+use Composer\Semver\Constraint\MatchAllConstraint;
 use SamJUK\MagentoPatchInstaller\Collector;
 use SamJUK\MagentoPatchInstaller\Patcher;
 use SamJUK\MagentoPatchInstaller\Plugin;
@@ -38,6 +40,18 @@ final class Project
     /** @var array<string, array<string, mixed>> */
     private $packages = [];
 
+    /** @var array<string, string[]> package => packages it requires */
+    private $requires = [];
+
+    /** @var string[] packages the root requires */
+    public $rootRequires = [];
+
+    /** @var array<string, string> package => its composer type */
+    private $types = [];
+
+    /** @var array<string, string[]> package => packages it replaces */
+    private $replaces = [];
+
     public function __construct(Sandbox $sandbox, string $name)
     {
         $this->root = $sandbox->mkdir('projects/' . $name);
@@ -56,8 +70,9 @@ final class Project
 
     /**
      * @param array<string, mixed> $extra
+     * @param string[] $requires
      */
-    public function package(string $name, array $extra): self
+    public function package(string $name, array $extra, array $requires = [], string $type = 'library', array $replaces = []): self
     {
         $dir = $this->root . '/vendor/' . $name;
 
@@ -66,6 +81,9 @@ final class Project
         }
 
         $this->packages[$name] = $extra;
+        $this->requires[$name] = $requires;
+        $this->types[$name] = $type;
+        $this->replaces[$name] = $replaces;
 
         return $this;
     }
@@ -106,6 +124,11 @@ final class Project
     {
         $root = new RootPackage('project/root', '1.0.0.0', '1.0.0');
         $root->setExtra($this->rootExtra);
+        $rootLinks = [];
+        foreach ($this->rootRequires as $target) {
+            $rootLinks[$target] = new Link('project/root', $target, new MatchAllConstraint(), Link::TYPE_REQUIRE, '*');
+        }
+        $root->setRequires($rootLinks);
 
         $config = new Config(false, $this->root);
         $config->merge(['config' => ['vendor-dir' => $this->root . '/vendor']]);
@@ -116,6 +139,17 @@ final class Project
         foreach ($this->packages as $name => $extra) {
             $package = new Package($name, '1.0.0.0', '1.0.0');
             $package->setExtra($extra);
+            $package->setType($this->types[$name]);
+            $links = [];
+            foreach ($this->requires[$name] ?? [] as $target) {
+                $links[$target] = new Link($name, $target, new MatchAllConstraint(), Link::TYPE_REQUIRE, '*');
+            }
+            $package->setRequires($links);
+            $replaced = [];
+            foreach ($this->replaces[$name] ?? [] as $target) {
+                $replaced[$target] = new Link($name, $target, new MatchAllConstraint(), Link::TYPE_REPLACE, '*');
+            }
+            $package->setReplaces($replaced);
             $repository->addPackage($package);
             $installed[$name] = $this->root . '/vendor/' . $name;
         }

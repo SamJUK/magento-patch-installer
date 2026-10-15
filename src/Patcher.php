@@ -65,6 +65,15 @@ class Patcher
     /** @var bool */
     private $applying = false;
 
+    /** @var array<int, array<string, mixed>>|null in apply order, with the order requires() implies */
+    private $declarations;
+
+    /** @var array<string, string>|null origin => why its order is undefined, once worked out */
+    private $unordered;
+
+    /** @var string[] the same, between two trusted packages, where it is only a warning */
+    private $unorderedWarnings = [];
+
     public function __construct(Composer $composer, ProcessExecutor $process)
     {
         $this->composer = $composer;
@@ -96,21 +105,22 @@ class Patcher
      *
      * The catalogue answers a different question from the report: not "where
      * does this store stand" but "what does this package cover". It runs no git
-     * and reads no vendor file, so it answers on a fresh clone before anything
-     * is installed — which is exactly when someone evaluating a meta package
-     * wants to ask. Base constraints are still checked, because those come from
-     * the lock file rather than from disk.
+     * and changes nothing. Base constraints are still checked, against what
+     * Composer records as installed rather than against the files.
      *
      * @return array<int, array<string, mixed>>
      */
     public function catalogue(): array
     {
         $entries = [];
-        $declarations = $this->collector->collect();
+        $declarations = $this->declarations();
 
-        $ids = [];
+        $unordered = $this->unordered($declarations);
+        $refused = [];
+        $ids = $owners = [];
         foreach ($declarations as $declaration) {
             $ids[$declaration['origin']] = (string) $declaration['id'];
+            $owners[$declaration['origin']] = (string) $declaration['owner'];
         }
 
         foreach ($declarations as $declaration) {
@@ -134,6 +144,25 @@ class Patcher
                 $mismatch = 'could not be read as a diff';
             }
 
+            // Refused here exactly as status refuses it, and so is everything
+            // built on it: the catalogue saying "applies" where status says
+            // "blocked" is two answers to one question.
+            // A patch the store skips is reported as skipped, as status does,
+            // whatever else is wrong with it.
+            if ($mismatch === null && ($declaration['skipped'] ?? null) === null) {
+                $mismatch = $this->unplaced($declaration, $unordered);
+
+                foreach ($declaration['depends'] as $needs) {
+                    if ($mismatch === null && isset($refused[$needs])) {
+                        $mismatch = sprintf('requires %s, which is not applied', $refused[$needs]);
+                    }
+                }
+
+                if ($mismatch !== null) {
+                    $refused[$declaration['origin']] = $declaration['label'];
+                }
+            }
+
             $entries[] = [
                 'id' => $declaration['id'],
                 'label' => $declaration['label'],
@@ -143,13 +172,18 @@ class Patcher
                 'line' => $declaration['line'],
                 'description' => $declaration['description'],
                 // Ids rather than the resolved indices: the catalogue is read
-                // by a person deciding whether this package covers them.
-                'depends' => array_values(array_map(
-                    static function (string $origin) use ($ids): string {
-                        return $ids[$origin] ?? '?';
+                // by a person deciding whether this package covers them. One in
+                // another package is named the way `depends` would name it.
+                'depends' => array_values(array_merge(array_map(
+                    static function (string $origin) use ($ids, $owners, $declaration): string {
+                        $owner = $owners[$origin] ?? null;
+
+                        return $owner === null || $owner === $declaration['owner']
+                            ? ($ids[$origin] ?? '?')
+                            : $owner . ':' . $ids[$origin];
                     },
                     $declaration['depends']
-                )),
+                ), $declaration['unresolved'] ?? [])),
                 'targets' => $targets,
                 'applicable' => $mismatch === null && ($declaration['skipped'] ?? null) === null,
                 'reason' => $declaration['skipped'] ?? $mismatch,
@@ -234,6 +268,12 @@ class Patcher
             $notices[] = ['level' => 'warning', 'message' => $message];
         }
 
+        $this->unordered($this->declarations());
+
+        foreach ($this->unorderedWarnings as $message) {
+            $notices[] = ['level' => 'warning', 'message' => $message];
+        }
+
         return $notices;
     }
 
@@ -275,11 +315,13 @@ class Patcher
     {
         $results = [];
         $broken = [];
-        $declarations = $this->collector->collect();
+        $unplaced = [];
+        $declarations = $this->declarations();
 
         $lastCreator = $this->lastCreators($declarations);
         $this->applying = $apply;
         $this->stacks($declarations);
+        $unordered = $this->unordered($declarations);
 
         // Reversals run first, and in reverse dependency order. A patch cannot
         // come off while another sits on top of it, so walking forward — the
@@ -322,18 +364,43 @@ class Patcher
                 continue;
             }
 
+            // A prerequisite nothing declares has no place in the order, so the
+            // patch has none either. Applying it anyway is how a store's own
+            // month lands beneath the months it rewrites. Refused in every
+            // mode, not just apply: there is no order in which it is right.
+            // Another version's patch is that, here, whatever is wrong with it:
+            // list says so, and a store is not blocked by a patch it cannot run.
+            // A bad `depends` is still a configuration error, from the Collector.
+            $unplacedBecause = $this->baseMismatch($declaration['base']) !== null
+                ? null
+                : $this->unplaced($declaration, $unordered);
+
+            if ($unplacedBecause !== null) {
+                $results[] = array_merge($declaration, [
+                    'applicable' => false,
+                    'blocked' => true,
+                    'reason' => $unplacedBecause,
+                    'fragments' => [],
+                ]);
+                $broken[$declaration['origin']] = $declaration['label'];
+                $unplaced[$declaration['origin']] = true;
+                continue;
+            }
+
             // Adobe stipulates each monthly isolated patch depends on the ones
             // before it. Once a prerequisite is missing, everything built on it
             // is refused by name rather than attempted — a hunk failure three
-            // patches later is a much worse way to learn the same thing.
+            // patches later is a much worse way to learn the same thing. That is
+            // an apply-time guard, except over a prerequisite with no place in
+            // the order, which is refused in every mode.
             $missing = null;
+            $unplacedBelow = false;
 
-            if ($apply) {
-                foreach ($declaration['depends'] as $needs) {
-                    if (isset($broken[$needs])) {
-                        $missing = $broken[$needs];
-                        break;
-                    }
+            foreach ($declaration['depends'] as $needs) {
+                if (isset($broken[$needs]) && ($apply || isset($unplaced[$needs]))) {
+                    $missing = $broken[$needs];
+                    $unplacedBelow = isset($unplaced[$needs]);
+                    break;
                 }
             }
 
@@ -348,6 +415,11 @@ class Patcher
                 // for the same base version, and one must not be able to block
                 // the other's chain.
                 $broken[$declaration['origin']] = $declaration['label'];
+
+                if ($unplacedBelow) {
+                    $unplaced[$declaration['origin']] = true;
+                }
+
                 continue;
             }
 
@@ -608,6 +680,405 @@ class Patcher
         }
 
         return $creators;
+    }
+
+    /**
+     * Why a patch has no place in the order and is refused in every mode, or
+     * null: a prerequisite nothing settles, a dependency cycle, or the store's
+     * own patch with no order against a package's (unordered()).
+     *
+     * @param array<string, mixed> $declaration
+     * @param array<string, string> $unordered
+     */
+    private function unplaced(array $declaration, array $unordered): ?string
+    {
+        if (($declaration['unresolved'] ?? []) !== []) {
+            return (string) ($declaration['unresolvedWhy']
+                ?? sprintf('depends on %s, which nothing declares', implode(', ', $declaration['unresolved'])));
+        }
+
+        if (!empty($declaration['cyclic'])) {
+            return 'part of a dependency cycle';
+        }
+
+        return $unordered[$declaration['origin']] ?? null;
+    }
+
+    /**
+     * The store's own patches that change a file a trusted package's patch also
+     * changes, where neither is built on the other.
+     *
+     * Ordering is declared, never guessed, so the order such a pair applies in
+     * is undefined. The usual way to get here is a store adding its own month
+     * on top of a package's chain without `depends`: the root is read first,
+     * applied first, and the package's months it rewrites then conflict on
+     * every run. The store's patch is refused, never the package's: the store
+     * can fix its own config, and nothing a store or a sibling declares may
+     * switch off a trusted package's security patch.
+     *
+     * Only where `depends` could fix it, which is within one base line. A pair
+     * on different lines (a store's top-level patch against a package's line)
+     * cannot be ordered at all, so it is a warning that says how to move it.
+     * Between two packages it is only ever a warning, and only where neither
+     * requires the other (declarations() orders those): neither vendor knows
+     * about the other and the store cannot edit their declarations, so
+     * refusing would make them impossible to install together, and a real
+     * clash still fails the run as a conflict. Within one package two
+     * independent fixes to a file are normal (Adobe's hotfix beside that
+     * month's patch) and the author owns the order.
+     *
+     * @param array<int, array<string, mixed>> $declarations in apply order
+     *
+     * @return array<string, string> origin => why it is refused
+     */
+    private function unordered(array $declarations): array
+    {
+        if ($this->unordered !== null) {
+            return $this->unordered;
+        }
+
+        $refused = $indexOf = [];
+
+        foreach ($declarations as $index => $declaration) {
+            $indexOf[$declaration['origin']] = $index;
+        }
+
+        $touches = $this->touches($declarations);
+        $root = $this->composer->getPackage()->getName();
+        $reach = [];
+        /** @var array<string, array{message: string, files: int}> $betweenPackages one warning per pair of packages */
+        $betweenPackages = [];
+        /** @var array<int, array<string, array<string, array{others: array<int, true>, target: string}>>> $store */
+        $store = [];
+        $line = static function (array $declaration): string {
+            return $declaration['line'] === null ? 'top-level "patches"' : '"' . $declaration['line'] . '" line';
+        };
+
+        foreach ($touches as $byOwner) {
+            // A file one source changes, however many patches it has there,
+            // is that source's to order. Most files stop here.
+            if (count($byOwner) < 2) {
+                continue;
+            }
+
+            $owners = array_keys($byOwner);
+
+            foreach ($owners as $position => $ownerA) {
+                foreach (array_slice($owners, $position + 1) as $ownerB) {
+                    // A package on top of one it requires was ordered by
+                    // declarations(): where all of the required one's patches here
+                    // come first, every pair is, and checking each was quadratic.
+                    foreach ([[$ownerA, $ownerB], [$ownerB, $ownerA]] as [$upper, $lower]) {
+                        $below = array_keys($byOwner[$lower]);
+                        $above = array_keys($byOwner[$upper]);
+
+                        if ($below !== [] && $above !== []
+                            && $this->buildsOn((string) $upper, (string) $lower)
+                            && max($below) < min($above)) {
+                            continue 2;
+                        }
+                    }
+
+                    foreach ($byOwner[$ownerA] as $a => $targetA) {
+                        foreach ($byOwner[$ownerB] as $b => $targetB) {
+                            if ($this->reaches(max($a, $b), min($a, $b), $declarations, $indexOf, $reach)) {
+                                continue;
+                            }
+
+                            // Between two packages, one warning for the pair, counting the
+                            // files: one per pair of patches grew with the square of their
+                            // chains, on every Composer run. The first unordered pair on a
+                            // file is enough to count it.
+                            if ((string) $ownerA !== $root && (string) $ownerB !== $root) {
+                                $pair = [(string) $ownerA, (string) $ownerB];
+                                sort($pair);
+                                $pairKey = implode("\0", $pair);
+                                $mutual = $this->collector->requires((string) $ownerA, (string) $ownerB)
+                                    && $this->collector->requires((string) $ownerB, (string) $ownerA);
+                                $betweenPackages[$pairKey] = $betweenPackages[$pairKey] ?? [
+                                    'message' => sprintf(
+                                        '%s "%s" and %s "%s" both change %s, and neither depends on the other, so the order '
+                                        . 'they apply in is undefined. %s',
+                                        $ownerA,
+                                        $declarations[$a]['label'],
+                                        $ownerB,
+                                        $declarations[$b]['label'],
+                                        $targetA,
+                                        $mutual
+                                            ? 'They require each other, so that says nothing about which comes first: '
+                                                . 'if one is built on the other, its package should say so with "depends".'
+                                            : 'If one is built on the other, its package should require the other, '
+                                                . 'or say so with "depends".'
+                                    ),
+                                    'files' => 0,
+                                ];
+                                $betweenPackages[$pairKey]['files']++;
+
+                                continue 3;
+                            }
+
+                            // The store's patch: collected, then reported once for each
+                            // package and line it has no order against, naming the links
+                            // that settle it rather than every link of a chain.
+                            [$own, $other, $target] = (string) $ownerA === $root ? [$a, $b, $targetA] : [$b, $a, $targetB];
+                            $otherOwner = (string) $declarations[$other]['owner'];
+                            $otherLine = (string) ($declarations[$other]['line'] ?? '');
+                            $found = $store[$own][$otherOwner][$otherLine] ?? ['others' => [], 'target' => $target];
+                            $found['others'][$other] = true;
+                            $store[$own][$otherOwner][$otherLine] = $found;
+                        }
+                    }
+                }
+            }
+        }
+
+        foreach ($store as $own => $byOther) {
+            foreach ($byOther as $otherOwner => $byLine) {
+                foreach ($byLine as $found) {
+                    $others = array_keys($found['others']);
+                    sort($others);
+                    $tips = $this->tips($others, $declarations, $indexOf);
+                    sort($tips);
+                    $target = $found['target'];
+                    $labels = implode(' and ', array_map(static function (int $index) use ($declarations): string {
+                        return '"' . $declarations[$index]['label'] . '"';
+                    }, $tips));
+                    $names = implode(', ', array_map(static function (int $index) use ($declarations, $otherOwner): string {
+                        return '"' . $otherOwner . ':' . $declarations[$index]['id'] . '"';
+                    }, $tips));
+                    $many = count($tips) > 1;
+
+                    if ($declarations[$own]['line'] !== $declarations[$tips[0]]['line']) {
+                        $this->unorderedWarnings[] = sprintf(
+                            'Your patch "%s" changes %s, which %s\'s %s also change%s, but they are in the %s '
+                            . 'and the %s, so nothing orders them. To build on %s, declare yours in the %s with "depends".',
+                            $declarations[$own]['label'],
+                            $target,
+                            $otherOwner,
+                            $labels,
+                            $many ? '' : 's',
+                            $line($declarations[$own]),
+                            $line($declarations[$tips[0]]),
+                            $many ? 'them' : 'it',
+                            $line($declarations[$tips[0]])
+                        );
+                        continue;
+                    }
+
+                    // A cumulative line cannot declare `depends`, so the advice has to
+                    // say where one can be.
+                    $this->errors[] = sprintf(
+                        '%s: patch "%s" changes %s, which %s\'s %s also change%s, and neither depends on the other — '
+                        . 'if yours is built on %s, %s"depends": [%s]',
+                        $root,
+                        $declarations[$own]['label'],
+                        $target,
+                        $otherOwner,
+                        $labels,
+                        $many ? '' : 's',
+                        $many ? 'them' : 'it',
+                        empty($declarations[$own]['cumulative'])
+                            ? 'add '
+                            : 'declare it in a line without "cumulative", with ',
+                        $names
+                    );
+
+                    $refused[$declarations[$own]['origin']] = $refused[$declarations[$own]['origin']]
+                        ?? sprintf('no order against %s (%s); both change %s', $labels, $otherOwner, $target);
+                }
+            }
+        }
+
+        foreach ($betweenPackages as $warning) {
+            $this->unorderedWarnings[] = $warning['files'] > 1
+                ? sprintf('%s The same goes for %d more files they both change.', $warning['message'], $warning['files'] - 1)
+                : $warning['message'];
+        }
+
+        return $this->unordered = $refused;
+    }
+
+    /**
+     * Every file a patch that applies here changes, by the sources that change it.
+     *
+     * @param array<int, array<string, mixed>> $declarations
+     *
+     * @return array<string, array<string, array<int, string>>> file key => owner => declaration => target
+     */
+    private function touches(array $declarations): array
+    {
+        $touches = [];
+
+        foreach ($declarations as $index => $declaration) {
+            if (($declaration['skipped'] ?? null) !== null
+                || $this->unplaced($declaration, []) !== null
+                || $this->baseMismatch($declaration['base']) !== null) {
+                continue;
+            }
+
+            foreach ($this->fragments($declaration) as $fragment) {
+                $touches[$this->fileKey($fragment->target())][(string) $declaration['owner']][$index] = $fragment->target();
+            }
+        }
+
+        return $touches;
+    }
+
+    /**
+     * The declarations, with each package's patch built on the same-file
+     * patches of the packages it requires.
+     *
+     * Requiring a package is how an add-on says it builds on it, and the
+     * Collector already applies it after them. It needs the edge as well: a
+     * later run checks a patch beneath the ones stacked on it, and without
+     * that the package it requires reads as conflicting once the add-on has
+     * rewritten its lines. Across base lines too: unlike `depends`, these
+     * carry no id to look up, and touches() only holds patches for this
+     * store's versions. The store's own patches still need `depends`: they
+     * are refused without it.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function declarations(): array
+    {
+        if ($this->declarations !== null) {
+            return $this->declarations;
+        }
+
+        $declarations = $this->collector->collect();
+        $indexOf = [];
+
+        foreach ($declarations as $index => $declaration) {
+            $indexOf[$declaration['origin']] = $index;
+        }
+
+        foreach ($this->touches($declarations) as $byOwner) {
+            foreach ($byOwner as $owner => $later) {
+                foreach ($byOwner as $other => $earlier) {
+                    if (!$this->buildsOn((string) $owner, (string) $other)) {
+                        continue;
+                    }
+
+                    // Only the tips: the rest of a chain is reached through them,
+                    // and an edge to every link was quadratic in chain length.
+                    $tips = $this->tips(array_keys($earlier), $declarations, $indexOf);
+
+                    foreach (array_keys($later) as $b) {
+                        $has = array_flip($declarations[$b]['depends']);
+
+                        foreach ($tips as $a) {
+                            $origin = $declarations[$a]['origin'];
+
+                            if ($a < $b && !isset($has[$origin])) {
+                                $declarations[$b]['depends'][] = $origin;
+                                $has[$origin] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return $this->declarations = $declarations;
+    }
+
+    /**
+     * Does package $owner build on package $other: requires it, and is not
+     * required by it? The root requires everything and is ordered by its own
+     * `depends` alone.
+     */
+    private function buildsOn(string $owner, string $other): bool
+    {
+        $root = $this->composer->getPackage()->getName();
+
+        return $owner !== $other
+            && $owner !== $root
+            && $other !== $root
+            && $this->collector->requires($owner, $other)
+            && !$this->collector->requires($other, $owner);
+    }
+
+    /**
+     * Of these patches, the ones none of the others is built on.
+     *
+     * @param int[] $indices in apply order
+     * @param array<int, array<string, mixed>> $declarations
+     * @param array<string, int> $indexOf
+     *
+     * @return int[]
+     */
+    private function tips(array $indices, array $declarations, array $indexOf): array
+    {
+        if (count($indices) < 2) {
+            return $indices;
+        }
+
+        $covered = $tips = [];
+
+        foreach (array_reverse($indices) as $index) {
+            if (isset($covered[$index])) {
+                continue;
+            }
+
+            $tips[] = $index;
+            $stack = [$index];
+
+            while ($stack !== []) {
+                foreach ($declarations[(int) array_pop($stack)]['depends'] as $origin) {
+                    $next = $indexOf[$origin] ?? null;
+
+                    if ($next !== null && !isset($covered[$next])) {
+                        $covered[$next] = true;
+                        $stack[] = $next;
+                    }
+                }
+            }
+        }
+
+        return $tips;
+    }
+
+    /**
+     * Is $later built on $earlier, through any chain of `depends`?
+     *
+     * Asked only of the few pairs that share a file across sources, rather than
+     * holding every patch's full ancestry — that is quadratic in chain length,
+     * and magento-patches:list ran out of memory on a long chain. Declarations
+     * are in dependency order, so nothing before $earlier can lead to it.
+     *
+     * @param array<int, array<string, mixed>> $declarations
+     * @param array<string, int> $indexOf
+     * @param array<string, bool> $reach
+     */
+    private function reaches(int $later, int $earlier, array $declarations, array $indexOf, array &$reach): bool
+    {
+        $key = $later . ':' . $earlier;
+
+        if (!isset($reach[$key])) {
+            $reach[$key] = false;
+            $stack = [$later];
+            $seen = [];
+
+            while ($stack !== []) {
+                $node = (int) array_pop($stack);
+
+                foreach ($declarations[$node]['depends'] as $origin) {
+                    $next = $indexOf[$origin] ?? null;
+
+                    if ($next === $earlier) {
+                        $reach[$key] = true;
+                        break 2;
+                    }
+
+                    if ($next !== null && $next > $earlier && !isset($seen[$next])) {
+                        $seen[$next] = true;
+                        $stack[] = $next;
+                    }
+                }
+            }
+        }
+
+        return $reach[$key];
     }
 
     /**

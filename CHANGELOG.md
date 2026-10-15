@@ -16,15 +16,32 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ### Fixed
 
+- **Security.** A store's own patch on top of a package's chain applied first,
+  beneath the months it rewrites. `depends` now resolves across packages and the
+  root within a base line, and all sources are ordered together.
+- **Security.** A private package's patches applied in install order. They now
+  apply after those of the packages it requires.
+- **Security.** A `depends` naming nothing was ignored. It is now refused, with
+  everything built on it, as is every patch in a dependency cycle.
 - **Security.** `composer -d <dir> dump-autoload` skipped healing. It now heals
   however the command is run.
 - **Security.** A root file's other copy could get different code from the
   served one. Only a patch's file headers are retargeted now.
 - `status --json` reports the exit code the command exits with.
 
+### Added
+
+- **Security.** A store's own patch overlapping a package's, with no order
+  between them, is refused, naming the `depends` to add. Between two packages it
+  is a warning.
+- `depends` can name another package's patch as `vendor/package:id`.
+- `magento-patches:list` shows prerequisites in other packages, and patches
+  built on a refused one.
+
 ### Changed
 
 - Licensed under OSL-3.0. Releases up to 0.2.1 stay under MIT.
+- A `depends` id is only looked up within its own base line.
 
 ## 0.2.1 — 2026-10-09
 

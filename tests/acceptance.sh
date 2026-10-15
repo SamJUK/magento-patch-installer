@@ -1003,6 +1003,198 @@ s_overlap() {
     check "clean again once restored" "0" "$(verify_code)"
 }
 
+s_sources() {
+    scenario "S29 patches from several sources build on each other"
+
+    # Three sources on one base line: the fixture package's chain, a second
+    # trusted package built on it, and the store's own composer.json built on
+    # both. The real case is a month a package cannot ship, added by the store
+    # on top of the package's chain; the root is read first, and was applied
+    # beneath the months it rewrites.
+    run "cd /var/www/html && cp composer.json /tmp/s29.json" >/dev/null
+
+    local base
+    base=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null | grep -B20 'FX-0002' | grep -oE '2\.4\.[0-9]+(-p[0-9]+)?' | head -1")
+
+    # The store rewrites the line FX-0001 added, two links below the one it
+    # names, so the check beneath it has to reach across owners and down a chain.
+    local escaper="vendor/magento/framework/Escaper.php"
+    local checkout="vendor/magento/module-checkout/etc/module.xml"
+    local unplaced="vendor/magento/module-theme/etc/module.xml"
+    run "cd /var/www/html
+         cp $escaper /tmp/esc.0
+         sed 's|/\\* chain-one \\*/|/* root-over-chain */|' /tmp/esc.0 > /tmp/esc.1
+         cp $checkout /tmp/chk.0
+         { cat /tmp/chk.0; echo '<!-- extra-one -->'; } > /tmp/chk.1
+         sed 's/extra-one/root-over-extra/' /tmp/chk.1 > /tmp/chk.2
+         cp $unplaced /tmp/thm.0
+         { cat /tmp/thm.0; echo '<!-- unplaced -->'; } > /tmp/thm.1" >/dev/null
+    fixture_step /tmp/esc.0 /tmp/esc.1 "$escaper" root-esc
+    fixture_step /tmp/chk.0 /tmp/chk.1 "$checkout" extra-one
+    fixture_step /tmp/chk.1 /tmp/chk.2 "$checkout" root-extra
+    fixture_step /tmp/thm.0 /tmp/thm.1 "$unplaced" root-unplaced
+
+    # A second package, built on the first. Its id for the link it needs is
+    # plain: only fixtures/patches declares FX-0003.
+    run "mkdir -p /fixture-extra/patches && cp /var/www/html/tests-fixtures/extra-one.patch /fixture-extra/patches/
+         php -r '
+            \$base = [\"magento/magento2-base\" => \"$base\"];
+            file_put_contents(\"/fixture-extra/composer.json\", json_encode([
+                \"name\" => \"fixtures/extra\", \"version\" => \"1.0.0\", \"type\" => \"library\",
+                \"extra\" => [\"magento-patches\" => [\"lines\" => [\"$base\" => [\"base\" => \$base, \"patches\" => [
+                    [\"id\" => \"EXTRA-1\", \"source\" => \"patches/extra-one.patch\", \"depends\" => [\"FX-0003\"]],
+                ]]]]],
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));'" >/dev/null
+
+    # The store names its prerequisite both ways: qualified, and by id alone.
+    run "cd /var/www/html && php -r '
+        \$j = json_decode(file_get_contents(\"composer.json\"), true);
+        \$j[\"extra\"][\"magento-patches\"][\"lines\"][\"$base\"] = [
+            \"base\" => [\"magento/magento2-base\" => \"$base\"],
+            \"patches\" => [
+                [\"id\" => \"ROOT-ESC\", \"source\" => \"tests-fixtures/root-esc.patch\", \"depends\" => [\"fixtures/patches:FX-0003\"]],
+                [\"id\" => \"ROOT-EXTRA\", \"source\" => \"tests-fixtures/root-extra.patch\", \"depends\" => [\"EXTRA-1\"]],
+            ],
+        ];
+        file_put_contents(\"composer.json\", json_encode(\$j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    ' && composer config repositories.extra path /fixture-extra" >/dev/null
+
+    local out
+    out=$(run "cd /var/www/html && composer require fixtures/extra:1.0.0 --no-interaction 2>&1")
+    check "installing the second package succeeds" "0" "$(echo "$out" | grep -c 'could not be applied')"
+
+    out=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>&1")
+    check "no configuration errors" "0" "$(echo "$out" | grep -c 'Patch configuration')"
+    checkne "the catalogue names the other package's link" "0" "$(echo "$out" | grep -c 'after fixtures/patches:FX-0003')"
+
+    check "the store's patch is on top of the package's chain" "1" "$(run "grep -c 'root-over-chain' /var/www/html/$escaper")"
+    check "and three sources stack on one file" "1" "$(run "grep -c 'root-over-extra' /var/www/html/$checkout")"
+    check "verify exits clean on the run after" "0" "$(verify_code)"
+    check "and nothing reads as a conflict" "0" \
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1 | grep -c CONFLICT")"
+    check "composer install still succeeds" "0" \
+        "$(run "cd /var/www/html && composer install --no-interaction >/dev/null 2>&1; echo \$?")"
+    local applied
+    applied=$(counted "magento-patches:apply" "applied")
+    check "a further apply writes nothing" "0" "${applied:-0}"
+
+    run "cd /var/www/html && composer reinstall magento/framework --no-interaction" >/dev/null
+    check "reinstalling the package under the chain heals all of it" "0" "$(verify_code)"
+    check "with the store's line back on top" "1" "$(run "grep -c 'root-over-chain' /var/www/html/$escaper")"
+
+    # Skipping the fixture package's link takes down the second package's and
+    # the store's, and each comes off before the one it is built on.
+    run "cd /var/www/html && cp composer.json /tmp/s29-unskipped.json
+         composer config --json extra.magento-patches.sources '{\"fixtures/patches\": {\"skip\": {\"FX-0003@$base\": \"testing the cascade\"}}}'" >/dev/null
+    run "cd /var/www/html && composer magento-patches:apply --no-interaction" >/dev/null
+    check "a skip comes off across owners, top first" "same" \
+        "$(run "cmp -s /tmp/esc.0 /var/www/html/$escaper && cmp -s /tmp/chk.0 /var/www/html/$checkout && echo same")"
+    check "and the store is clean with them off" "0" "$(verify_code)"
+    run "cd /var/www/html && cp /tmp/s29-unskipped.json composer.json && composer magento-patches:apply --no-interaction" >/dev/null
+    check "lifting the skip puts all three back" "11" \
+        "$(run "grep -c 'root-over-chain' /var/www/html/$escaper")$(run "grep -c 'root-over-extra' /var/www/html/$checkout")"
+
+    # A prerequisite nothing declares: refused, and nothing written, rather than
+    # applied wherever it happens to fall.
+    run "cd /var/www/html && php -r '
+        \$j = json_decode(file_get_contents(\"composer.json\"), true);
+        \$j[\"extra\"][\"magento-patches\"][\"lines\"][\"$base\"][\"patches\"][] =
+            [\"id\" => \"ROOT-BAD\", \"source\" => \"tests-fixtures/root-unplaced.patch\", \"depends\" => [\"NOPE\"]];
+        file_put_contents(\"composer.json\", json_encode(\$j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    '" >/dev/null
+    out=$(run "cd /var/www/html && composer magento-patches:apply --no-interaction 2>&1")
+    check "an unplaced patch is never written" "0" "$(run "grep -c 'unplaced' /var/www/html/$unplaced")"
+    checkne "it is shown as blocked, and why" "0" "$(echo "$out" | grep -c 'NOPE, which nothing declares')"
+    check "and it is a configuration error" "3" "$(verify_code)"
+    check "which fails composer install" "1" \
+        "$(run "cd /var/www/html && composer install --no-interaction >/dev/null 2>&1 && echo 0 || echo 1")"
+    check "still unwritten after the install" "0" "$(run "grep -c 'unplaced' /var/www/html/$unplaced")"
+
+    # The store's own patch on a file the package's chain changes, with no
+    # depends at all. Read first, it used to be applied first. Now it is
+    # refused, and the package's chain is left exactly as it was.
+    local customer="vendor/magento/module-customer/etc/module.xml"
+    run "cd /var/www/html
+         cp $customer /tmp/cus.0
+         { cat /tmp/cus.0; echo '<!-- loose -->'; } > /tmp/cus.1" >/dev/null
+    fixture_step /tmp/cus.0 /tmp/cus.1 "$customer" root-loose
+    run "cd /var/www/html && php -r '
+        \$j = json_decode(file_get_contents(\"composer.json\"), true);
+        \$patches = array_values(array_filter(\$j[\"extra\"][\"magento-patches\"][\"lines\"][\"$base\"][\"patches\"],
+            static function (array \$p): bool { return \$p[\"id\"] !== \"ROOT-BAD\"; }));
+        \$patches[] = [\"id\" => \"ROOT-LOOSE\", \"source\" => \"tests-fixtures/root-loose.patch\"];
+        \$j[\"extra\"][\"magento-patches\"][\"lines\"][\"$base\"][\"patches\"] = \$patches;
+        file_put_contents(\"composer.json\", json_encode(\$j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    '" >/dev/null
+    out=$(run "cd /var/www/html && composer magento-patches:apply --no-interaction 2>&1")
+    check "a store patch with no order is never written" "0" "$(run "grep -c 'loose' /var/www/html/$customer")"
+    check "and the package's chain is left as it was" "same" "$(run "cmp -s /tmp/cus.0 /var/www/html/$customer && echo same")"
+    checkne "the fix is spelled out" "0" "$(echo "$out" | grep -c 'add \"depends\": \[\"fixtures/patches:FX-0003\"\]')"
+    check "and it is a configuration error" "3" "$(verify_code)"
+
+    run "cd /var/www/html
+         composer remove fixtures/extra --no-interaction --no-plugins >/dev/null 2>&1
+         cp /tmp/s29.json composer.json
+         cp /tmp/esc.0 $escaper
+         cp /tmp/chk.0 $checkout
+         composer install --no-interaction --no-plugins >/dev/null 2>&1" >/dev/null
+    check "clean again once restored" "0" "$(verify_code)"
+}
+
+s_add_on() {
+    scenario "S30 a package goes on top of the package it requires, without depends"
+
+    # A store's private package carrying a month the public one cannot ship.
+    # It requires the package it builds on and names nothing in depends; it
+    # sorts first, which used to put it beneath the chain it extends.
+    run "cd /var/www/html && cp composer.json /tmp/s30.json" >/dev/null
+
+    local base
+    base=$(run "cd /var/www/html && composer magento-patches:list --no-interaction 2>/dev/null | grep -B20 'FX-0002' | grep -oE '2\.4\.[0-9]+(-p[0-9]+)?' | head -1")
+
+    local escaper="vendor/magento/framework/Escaper.php"
+    run "cd /var/www/html
+         cp $escaper /tmp/s30.0
+         sed 's|/\\* chain-one \\*/|/* add-on-over-chain */|' /tmp/s30.0 > /tmp/s30.1" >/dev/null
+    fixture_step /tmp/s30.0 /tmp/s30.1 "$escaper" add-on-esc
+
+    run "mkdir -p /fixture-add-on/patches && cp /var/www/html/tests-fixtures/add-on-esc.patch /fixture-add-on/patches/
+         php -r '
+            \$base = [\"magento/magento2-base\" => \"$base\"];
+            file_put_contents(\"/fixture-add-on/composer.json\", json_encode([
+                \"name\" => \"fixtures/aaa-add-on\", \"version\" => \"1.0.0\", \"type\" => \"library\",
+                \"require\" => [\"fixtures/patches\" => \"*\"],
+                \"extra\" => [\"magento-patches\" => [\"lines\" => [\"$base\" => [\"base\" => \$base, \"patches\" => [
+                    [\"id\" => \"ADD-ON-1\", \"source\" => \"patches/add-on-esc.patch\"],
+                ]]]]],
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));'
+         cd /var/www/html && composer config repositories.add-on path /fixture-add-on" >/dev/null
+
+    local out
+    out=$(run "cd /var/www/html && composer require fixtures/aaa-add-on:1.0.0 --no-interaction 2>&1")
+    check "installing the add-on succeeds" "0" "$(echo "$out" | grep -c 'could not be applied')"
+    check "with no configuration error" "0" "$(echo "$out" | grep -c 'Patch configuration')"
+    check "and no warning that the order is undefined" "0" "$(echo "$out" | grep -c 'neither depends on the other')"
+    check "the add-on's patch is on top of the chain" "1" "$(run "grep -c 'add-on-over-chain' /var/www/html/$escaper")"
+    check "verify exits clean on the run after" "0" "$(verify_code)"
+    check "and nothing reads as a conflict" "0" \
+        "$(run "cd /var/www/html && composer magento-patches:status --no-interaction 2>&1 | grep -c CONFLICT")"
+    local applied
+    applied=$(counted "magento-patches:apply" "applied")
+    check "a further apply writes nothing" "0" "${applied:-0}"
+
+    run "cd /var/www/html && composer reinstall magento/framework --no-interaction" >/dev/null
+    check "reinstalling the package under the chain heals all of it" "0" "$(verify_code)"
+    check "with the add-on's line back on top" "1" "$(run "grep -c 'add-on-over-chain' /var/www/html/$escaper")"
+
+    run "cd /var/www/html
+         composer remove fixtures/aaa-add-on --no-interaction --no-plugins >/dev/null 2>&1
+         cp /tmp/s30.json composer.json
+         cp /tmp/s30.0 $escaper
+         composer install --no-interaction --no-plugins >/dev/null 2>&1" >/dev/null
+    check "clean again once restored" "0" "$(verify_code)"
+}
+
 s_banner() {
     scenario "S23 the banner says OK, WARN or ISSUE, without needing colour"
 
@@ -1144,6 +1336,8 @@ run_image() {
     s_selection
     s_include
     s_overlap
+    s_sources
+    s_add_on
     s_banner
     s_dump_autoload
     s_fresh_vendor

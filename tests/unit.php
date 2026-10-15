@@ -276,7 +276,7 @@ if ($haveComposer) {
 $suites = require __DIR__ . '/unit/suites.php';
 
 if ($haveComposer) {
-    $suites = array_merge($suites, require __DIR__ . '/unit/collector-suite.php');
+    $suites = array_merge($suites, require __DIR__ . '/unit/collector-suite.php', require __DIR__ . '/unit/review-suite.php');
 }
 
 $only = $argv[1] ?? null;
