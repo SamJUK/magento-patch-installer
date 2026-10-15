@@ -12,6 +12,8 @@ use Composer\EventDispatcher\EventSubscriberInterface;
 use Composer\IO\IOInterface;
 use Composer\Plugin\Capable;
 use Composer\Plugin\Capability\CommandProvider as CommandProviderCapability;
+use Composer\Plugin\CommandEvent;
+use Composer\Plugin\PluginEvents;
 use Composer\Plugin\PluginInterface;
 use Composer\Script\ScriptEvents;
 
@@ -36,6 +38,9 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
     /** @var IOInterface */
     private $io;
 
+    /** @var string|null the command Composer says it is running, once it has */
+    private $command;
+
     public function activate(Composer $composer, IOInterface $io): void
     {
         $this->composer = $composer;
@@ -58,6 +63,7 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
     public static function getSubscribedEvents(): array
     {
         return [
+            PluginEvents::COMMAND => 'onCommand',
             ScriptEvents::POST_INSTALL_CMD => [['onPostRun', self::PRIORITY]],
             ScriptEvents::POST_UPDATE_CMD => [['onPostRun', self::PRIORITY]],
             // `composer dump-autoload` fires this and never fires the two
@@ -71,6 +77,11 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
         ];
     }
 
+    public function onCommand(CommandEvent $event): void
+    {
+        $this->command = $event->getCommandName();
+    }
+
     /**
      * Only when dump-autoload is the command being run.
      *
@@ -79,39 +90,22 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
      * on it there would both duplicate the report and inspect the mirror at the
      * wrong moment. Those runs are already covered, later and correctly, by
      * POST_INSTALL_CMD and POST_UPDATE_CMD.
+     *
+     * Composer names the command before it dumps the autoloader, with aliases,
+     * abbreviations and --working-dir already resolved: reading argv for it
+     * took `composer -d /store dump-autoload` for a command called "/store".
+     * Hearing no name at all means this plugin was installed partway through
+     * the run, by an install, update, require, remove or create-project whose
+     * own post-install or post-update event is still to come, or that
+     * `run-script` fired the event by hand.
      */
     public function onAutoloadDump(): void
     {
-        if (!self::isDumpAutoloadCommand()) {
+        if ($this->command !== 'dump-autoload') {
             return;
         }
 
         $this->onPostRun();
-    }
-
-    /**
-     * Composer resolves abbreviations, so the command can arrive as
-     * dump-autoload, dumpautoload, dump-auto or du. When the command cannot be
-     * determined at all, say yes: running twice is noisy, and not running is
-     * how a store ends up unpatched.
-     */
-    private static function isDumpAutoloadCommand(): bool
-    {
-        $argv = $_SERVER['argv'] ?? null;
-
-        if (!is_array($argv)) {
-            return true;
-        }
-
-        foreach (array_slice($argv, 1) as $argument) {
-            if (!is_string($argument) || $argument === '' || $argument[0] === '-') {
-                continue;
-            }
-
-            return strpos($argument, 'du') === 0;
-        }
-
-        return true;
     }
 
     public function onPostRun(): void

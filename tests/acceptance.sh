@@ -1085,6 +1085,18 @@ s_dump_autoload() {
     run "cd /var/www/html && composer dump-autoload -o --no-interaction" >/dev/null
     check "dump-autoload puts it back" "0" "$(verify_code)"
 
+    # Composer names the command once --working-dir and abbreviations are
+    # resolved. Reading argv took `-d /var/www/html du` for a command called
+    # "/var/www/html", and skipped healing. Composer 2.2 rejects that spelling
+    # itself, so it is only checked where Composer accepts it.
+    run "sed -i '$ d' /var/www/html/vendor/magento/framework/Escaper.php" >/dev/null
+    if run "cd /tmp && composer -d /var/www/html du --no-interaction >/dev/null 2>&1 && echo ran" | grep -q ran; then
+        check "dump-autoload from another directory puts it back" "0" "$(verify_code)"
+    else
+        run "cd /tmp && composer --working-dir=/var/www/html dump-auto --no-interaction" >/dev/null
+        check "dump-autoload from another directory puts it back" "0" "$(verify_code)"
+    fi
+
     # And the event must not double-report during an ordinary install, where
     # it fires before post-install-cmd and before the root files are deployed.
     local reports

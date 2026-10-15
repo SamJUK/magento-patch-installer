@@ -16,6 +16,7 @@ use Composer\Repository\InstalledArrayRepository;
 use Composer\Repository\RepositoryManager;
 use SamJUK\MagentoPatchInstaller\Collector;
 use SamJUK\MagentoPatchInstaller\Patcher;
+use SamJUK\MagentoPatchInstaller\Plugin;
 
 /**
  * Collector is the only class that needs a real Composer object, which is why
@@ -91,6 +92,14 @@ final class Project
     public function patcher(): Patcher
     {
         return Patcher::fromComposer($this->composer(), new \Composer\IO\NullIO());
+    }
+
+    public function plugin(\Composer\IO\IOInterface $io): Plugin
+    {
+        $plugin = new Plugin();
+        $plugin->activate($this->composer(), $io);
+
+        return $plugin;
     }
 
     private function composer(): Composer

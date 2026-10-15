@@ -16,6 +16,8 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ### Fixed
 
+- **Security.** `composer -d <dir> dump-autoload` skipped healing. It now heals
+  however the command is run.
 - **Security.** A root file's other copy could get different code from the
   served one. Only a patch's file headers are retargeted now.
 - `status --json` reports the exit code the command exits with.

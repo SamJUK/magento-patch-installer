@@ -15,6 +15,8 @@ use SamJUK\MagentoPatchInstaller\Applier;
 use SamJUK\MagentoPatchInstaller\Collector;
 use SamJUK\MagentoPatchInstaller\Fragment;
 use SamJUK\MagentoPatchInstaller\Renderer;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 
 /**
  * @return array<string, callable>
@@ -1146,6 +1148,40 @@ return [
         $applier->retarget("diff --git a/x.txt b/x.txt\nnew file mode 100644\n--- /dev/null\n+++ b/x.txt\n@@ -0,0 +1 @@\n+a\n", 'x.txt', 'y.txt'),
         '/dev/null is left as it is'
     );
+},
+
+'plugin' => static function (Sandbox $sandbox): void {
+    $p = (new Project($sandbox, 'plugin'))
+        ->root(['magento-patches' => ['patches' => [['id' => 'A-1', 'source' => 'a.patch']]]])
+        ->write('a.patch', "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n")
+        ->write('a.txt', "one\n");
+
+    $event = static function (string $name): CommandEvent {
+        return new CommandEvent(PluginEvents::COMMAND, $name, new ArrayInput([]), new NullOutput());
+    };
+
+    $reported = static function (?string $command) use ($p, $event): bool {
+        $io = new BufferIO();
+        $plugin = $p->plugin($io);
+
+        if ($command !== null) {
+            $plugin->onCommand($event($command));
+        }
+
+        $plugin->onAutoloadDump();
+
+        return strpos($io->getOutput(), 'Magento security patches') !== false;
+    };
+
+    Assert::case('the autoload dump heals when dump-autoload is the command');
+    Assert::true($reported('dump-autoload'), 'runs on dump-autoload');
+
+    Assert::case('the autoload dump inside other commands waits for their own event');
+    Assert::false($reported('install'), 'not inside install');
+    Assert::false($reported('reinstall'), 'not inside reinstall');
+
+    Assert::case('a plugin installed partway through a run waits too');
+    Assert::false($reported(null), 'no command heard, no run');
 },
 
 ];
