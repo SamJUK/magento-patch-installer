@@ -14,7 +14,11 @@ here into the GitHub release body. See `docs/releasing.md`.
 
 ## Unreleased
 
-Nothing yet.
+### Changed
+
+- The README is a quick start now, with the reference moved to `docs/`. It
+  recommends trusting a package by name (`samjuk/m2-meta-security-patches`)
+  rather than `samjuk/*`; existing patterns keep working.
 
 ## 0.3.0
 
